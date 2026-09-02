@@ -11,9 +11,9 @@ import uuid
 import logging
 
 app = FastAPI(
-    title="Setu Municipal Helpline Backend",
-    description="Stateful Conversation Tracking, Business Logic, and Freshdesk Integration Server",
-    version="2.1.0"
+    title="Setu Municipal Helpline Backend Tools",
+    description="Backend tool execution server providing create_ticket and transfer_to_human for Setu Voice AI",
+    version="2.2.0"
 )
 
 logger = logging.getLogger("uvicorn.error")
@@ -21,60 +21,32 @@ logger = logging.getLogger("uvicorn.error")
 # Allowed issue types for municipal helpline
 ALLOWED_ISSUE_TYPES = {"water", "garbage", "electricity", "certificate", "other"}
 
-# Word-to-digit map for Indian phone number parsing
 WORD_TO_DIGIT = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
 }
 
 # ------------------------------------------------------------------------------
-# In-Memory Conversation Database (Keyed by conversation_id)
+# Pydantic Request Models for Backend Tools
 # ------------------------------------------------------------------------------
-conversations_db: Dict[str, Dict[str, Any]] = {}
-
-
-def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
-    """Retrieves or initializes conversation state dictionary."""
-    if conversation_id not in conversations_db:
-        conversations_db[conversation_id] = {
-            "conversation_id": conversation_id,
-            "phone": None,
-            "phone_confidence": "low",
-            "location": None,
-            "location_confidence": "low",
-            "issue_type": None,
-            "issue_type_confidence": "low",
-            "description": None,
-            "description_confidence": "low",
-            "confirmed": False,
-            "ticket_id": None,
-            "updated_at": time.time()
-        }
-    return conversations_db[conversation_id]
-
-
-# ------------------------------------------------------------------------------
-# Pydantic Request Models
-# ------------------------------------------------------------------------------
-class TicketCreateRequest(BaseModel):
+class CreateTicketRequest(BaseModel):
     phone: str = Field(..., description="10-digit Indian mobile number of caller")
     location: str = Field(..., description="Location, ward, or area name")
     issue_type: str = Field(..., description="Type of issue: water, garbage, electricity, certificate, other")
     description: str = Field(..., description="Brief description of the issue")
-    confirmation_status: Optional[str] = Field("confirmed", description="Confirmation status from caller")
 
 
-class ProcessMessageRequest(BaseModel):
-    conversation_id: str
-    message: str
+class TransferToHumanRequest(BaseModel):
+    reason: str = Field(..., description="Reason for escalating to a human agent")
+    summary: str = Field(..., description="Brief summary of conversation state and caller situation")
 
 
 # ------------------------------------------------------------------------------
-# Helper Functions: Validation & Field Extraction
+# Validation Helpers
 # ------------------------------------------------------------------------------
 def validate_indian_phone(text: str) -> tuple[bool, str]:
     """
-    Validates an Indian 10-digit mobile number from string/spoken words.
+    Validates an Indian 10-digit mobile number starting with 6, 7, 8, or 9.
     Returns (is_valid, cleaned_10_digit_phone)
     """
     if not text or not isinstance(text, str):
@@ -102,123 +74,70 @@ def validate_indian_phone(text: str) -> tuple[bool, str]:
     return False, digits
 
 
-def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Extracts phone, location, issue_type, and description from the latest user message
-    and updates conversation state with confidence levels.
-    """
-    text = user_text.strip()
-    lowered = text.lower()
+def validate_issue_type(issue_type: str) -> tuple[bool, str]:
+    """Validates issue_type against allowed demo values."""
+    if not issue_type or not isinstance(issue_type, str):
+        return False, ""
 
-    # 1. Extract & Validate Phone Number
-    is_valid_phone, clean_phone = validate_indian_phone(text)
-    if is_valid_phone:
-        state["phone"] = clean_phone
-        state["phone_confidence"] = "high"
-    elif len(clean_phone) > 0 and state["phone_confidence"] != "high":
-        state["phone_confidence"] = "low"
-
-    # 2. Extract Location
-    location_match = re.search(r"\b(ward\s*\d+|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+|block\s*[a-z0-9]+)\b", lowered)
-    if location_match:
-        state["location"] = location_match.group(0).title()
-        state["location_confidence"] = "high"
-    elif state["phone_confidence"] == "high" and state["location_confidence"] != "high" and not is_valid_phone:
-        if len(text) >= 3 and not re.search(r"^\d+$", "".join(re.findall(r"\d", text))) and not any(k in lowered for k in ["water", "electricity", "garbage", "certificate", "yes", "no", "hello"]):
-            state["location"] = text.title()
-            state["location_confidence"] = "high"
-
-    # 3. Extract Issue Type
-    if "water" in lowered or "pipe" in lowered or "leak" in lowered or "drain" in lowered:
-        state["issue_type"] = "water"
-        state["issue_type_confidence"] = "high"
-    elif "garbage" in lowered or "trash" in lowered or "waste" in lowered or "clean" in lowered:
-        state["issue_type"] = "garbage"
-        state["issue_type_confidence"] = "high"
-    elif "electricity" in lowered or "power" in lowered or "light" in lowered or "current" in lowered or "generator" in lowered:
-        state["issue_type"] = "electricity"
-        state["issue_type_confidence"] = "high"
-    elif "certificate" in lowered or "birth" in lowered or "death" in lowered or "license" in lowered:
-        state["issue_type"] = "certificate"
-        state["issue_type_confidence"] = "high"
-
-    # 4. Extract Description
-    if state["phone_confidence"] == "high" and state["location_confidence"] == "high" and state["issue_type_confidence"] == "high":
-        if lowered not in ["yes", "no", "hello", "ok", "correct", "confirm", "haan", "ha", "yes, correct"]:
-            if not is_valid_phone and not location_match:
-                state["description"] = text
-                state["description_confidence"] = "high"
-
-    # 5. Handle Confirmation
-    if lowered in ["yes", "correct", "true", "confirm", "haan", "haa", "ha", "yes correct", "yes, correct"]:
-        if (state["phone_confidence"] == "high" and
-            state["location_confidence"] == "high" and
-            state["issue_type_confidence"] == "high" and
-            state["description_confidence"] == "high"):
-            state["confirmed"] = True
-
-    state["updated_at"] = time.time()
-    return state
-
-
-def generate_next_response(state: Dict[str, Any]) -> str:
-    """
-    Generates conversational reply based on missing fields in priority order:
-    1. Phone -> 2. Location -> 3. Issue Type -> 4. Description -> 5. Confirmation
-    """
-    # Priority 1: Phone
-    if state["phone_confidence"] != "high":
-        return "Namaste! Welcome to Setu municipal helpline. Could you please provide your 10-digit mobile number?"
-
-    # Priority 2: Location
-    if state["location_confidence"] != "high":
-        return f"Thank you. I have noted your phone number as {state['phone']}. Which ward, area, or location are you calling from?"
-
-    # Priority 3: Issue Type
-    if state["issue_type_confidence"] != "high":
-        return f"Got it. Location is {state['location']}. What type of issue are you facing? (water, garbage, electricity, certificate, or other)"
-
-    # Priority 4: Description
-    if state["description_confidence"] != "high":
-        return f"Understood, issue type is {state['issue_type']}. Could you please give a brief description of the problem?"
-
-    # Priority 5: Confirmation
-    if not state["confirmed"]:
-        return (f"Let me confirm your details: Phone {state['phone']}, Location {state['location']}, "
-                f"Issue Type {state['issue_type']}, Description '{state['description']}'. Is this information correct?")
-
-    # Confirmed -> Execute Ticket Creation
-    if state["confirmed"] and not state["ticket_id"]:
-        ticket_req = TicketCreateRequest(
-            phone=state["phone"],
-            location=state["location"],
-            issue_type=state["issue_type"],
-            description=state["description"],
-            confirmation_status="confirmed"
-        )
-        res = execute_create_ticket(ticket_req)
-        if res.get("success"):
-            state["ticket_id"] = res.get("ticket_id")
-            return f"Thank you! Your complaint has been registered in Freshdesk with Ticket ID #{res.get('ticket_id')}."
-        else:
-            return f"Your details are confirmed, but Freshdesk ticket creation returned: {res.get('message')}"
-
-    return f"Your complaint is already registered under Ticket ID #{state['ticket_id']}. Thank you for calling Setu!"
+    normalized = issue_type.strip().lower()
+    if normalized in ALLOWED_ISSUE_TYPES:
+        return True, normalized
+    return False, normalized
 
 
 # ------------------------------------------------------------------------------
-# Freshdesk Integration
+# Tool 1: create_ticket Implementation
 # ------------------------------------------------------------------------------
-def execute_create_ticket(data: TicketCreateRequest) -> Dict[str, Any]:
-    """Validates parameters and creates a real ticket in Freshdesk."""
+def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
+    """
+    Validates create_ticket parameters and creates a real ticket in Freshdesk.
+    """
+    # 1. Validate Phone Number
+    phone_valid, clean_phone = validate_indian_phone(data.phone)
+    if not phone_valid:
+        logger.warning(f"create_ticket validation failed: Invalid phone number '{data.phone}'")
+        return {
+            "success": False,
+            "error": "invalid_phone_number",
+            "message": f"'{data.phone}' is not a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9."
+        }
+
+    # 2. Validate Location
+    clean_location = data.location.strip() if data.location else ""
+    if not clean_location:
+        return {
+            "success": False,
+            "error": "invalid_location",
+            "message": "Location parameter cannot be empty."
+        }
+
+    # 3. Validate Issue Type
+    issue_valid, clean_issue_type = validate_issue_type(data.issue_type)
+    if not issue_valid:
+        return {
+            "success": False,
+            "error": "invalid_issue_type",
+            "message": f"'{data.issue_type}' is not a recognized issue type. Allowed: water, garbage, electricity, certificate, other."
+        }
+
+    # 4. Validate Description
+    clean_description = data.description.strip() if data.description else ""
+    if not clean_description:
+        return {
+            "success": False,
+            "error": "invalid_description",
+            "message": "Description parameter cannot be empty."
+        }
+
+    # 5. Read Freshdesk Credentials from Environment Variables
     raw_domain = os.environ.get("FRESHDESK_DOMAIN", "").strip()
     freshdesk_key = os.environ.get("FRESHDESK_API_KEY", "").strip()
 
     if not raw_domain or not freshdesk_key:
-        logger.error("Freshdesk credentials missing in environment variables.")
+        logger.error("Freshdesk API configuration missing (FRESHDESK_DOMAIN or FRESHDESK_API_KEY not set).")
         return {
             "success": False,
-            "error": "FRESHDESK_CONFIG_MISSING",
+            "error": "freshdesk_config_missing",
             "message": "Freshdesk credentials (FRESHDESK_DOMAIN / FRESHDESK_API_KEY) are not set in environment variables."
         }
 
@@ -229,10 +148,10 @@ def execute_create_ticket(data: TicketCreateRequest) -> Dict[str, Any]:
     freshdesk_url = f"https://{freshdesk_domain}/api/v2/tickets"
 
     payload = {
-        "subject": f"Municipal Helpline [{data.issue_type.upper()}]: Reported in {data.location}",
-        "description": f"Phone: {data.phone}\nLocation: {data.location}\nIssue Type: {data.issue_type}\nDescription: {data.description}\nStatus: Confirmed by caller",
-        "email": f"caller_{data.phone}@setu-helpline.local",
-        "phone": data.phone,
+        "subject": clean_issue_type,
+        "description": f"Phone: {clean_phone}\nLocation: {clean_location}\nIssue Type: {clean_issue_type}\nDescription: {clean_description}",
+        "email": f"caller_{clean_phone}@setu-helpline.local",
+        "phone": clean_phone,
         "priority": 1,
         "status": 2
     }
@@ -249,24 +168,66 @@ def execute_create_ticket(data: TicketCreateRequest) -> Dict[str, Any]:
         if response.status_code == 201:
             ticket_data = response.json()
             ticket_id = ticket_data.get("id")
+            logger.info(f"Freshdesk ticket #{ticket_id} created successfully for phone {clean_phone}")
             return {
                 "success": True,
                 "ticket_id": ticket_id,
-                "message": f"Complaint successfully registered in Freshdesk with Ticket ID #{ticket_id}.",
-                "data": ticket_data
+                "message": f"Complaint registered successfully. Ticket ID is {ticket_id}."
             }
         else:
+            logger.error(f"Freshdesk API error status {response.status_code}: {response.text}")
             return {
                 "success": False,
-                "error": "FRESHDESK_API_ERROR",
-                "message": f"Freshdesk returned status {response.status_code}: {response.text}"
+                "error": "ticket_creation_failed",
+                "message": f"Freshdesk ticket creation failed with status code {response.status_code}."
             }
+
     except Exception as e:
+        logger.exception("Failed to connect to Freshdesk API")
         return {
             "success": False,
-            "error": "FRESHDESK_CONNECTION_FAILED",
-            "message": f"Connection failed: {str(e)}"
+            "error": "ticket_creation_failed",
+            "message": f"Failed to connect to Freshdesk server: {str(e)}"
         }
+
+
+# ------------------------------------------------------------------------------
+# Tool 2: transfer_to_human Implementation
+# ------------------------------------------------------------------------------
+def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
+    """
+    Validates parameters, logs the human escalation clearly to the console, and returns success.
+    """
+    clean_reason = data.reason.strip() if data.reason else ""
+    clean_summary = data.summary.strip() if data.summary else ""
+
+    if not clean_reason:
+        return {
+            "success": False,
+            "error": "invalid_reason",
+            "message": "Reason parameter cannot be empty."
+        }
+
+    if not clean_summary:
+        return {
+            "success": False,
+            "error": "invalid_summary",
+            "message": "Summary parameter cannot be empty."
+        }
+
+    # Console Logging
+    print("\n========== HUMAN ESCALATION ==========")
+    print(f"Reason:  {clean_reason}")
+    print(f"Summary: {clean_summary}")
+    print("=======================================\n")
+
+    logger.info(f"HUMAN ESCALATION | Reason: {clean_reason} | Summary: {clean_summary}")
+
+    return {
+        "success": True,
+        "status": "human_escalation_requested",
+        "message": "Human escalation request logged successfully."
+    }
 
 
 # ------------------------------------------------------------------------------
@@ -275,118 +236,28 @@ def execute_create_ticket(data: TicketCreateRequest) -> Dict[str, Any]:
 @app.get("/")
 async def root():
     return {
-        "status": "Setu Stateful Conversation Backend is active!",
-        "architecture": "In-Memory State Machine & Freshdesk Integration",
-        "active_conversations": len(conversations_db)
+        "status": "Setu Supporting Tools Backend is active!",
+        "architecture": "Agora Conversational AI Backend Tool Execution Server",
+        "tools": ["create_ticket", "transfer_to_human"]
     }
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-@app.get("/conversation/{conversation_id}")
-async def get_conversation_state(conversation_id: str):
-    """Retrieves current tracked state for a conversation."""
-    if conversation_id not in conversations_db:
-        raise HTTPException(status_code=404, detail=f"Conversation ID '{conversation_id}' not found.")
-    return conversations_db[conversation_id]
-
-
-@app.post("/conversation/reset/{conversation_id}")
-async def reset_conversation_state(conversation_id: str):
-    """Resets state for a conversation ID."""
-    if conversation_id in conversations_db:
-        del conversations_db[conversation_id]
-    return {"status": "reset", "conversation_id": conversation_id}
-
-
-@app.post("/conversation/process")
-async def process_conversation_message(req: ProcessMessageRequest):
-    """
-    Direct message processing endpoint:
-    Takes {conversation_id, message}, extracts fields, updates state, and returns response.
-    """
-    state = get_or_create_conversation(req.conversation_id)
-    extract_fields_from_text(req.message, state)
-    reply = generate_next_response(state)
-    return {
-        "conversation_id": req.conversation_id,
-        "reply": reply,
-        "state": state
-    }
-
-
-@app.get("/v1/chat/completions")
-async def chat_get():
-    return {"message": "Setu Supporting Backend is active. Waiting for POST requests."}
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    """
-    OpenAI-compatible completions endpoint:
-    Parses messages, extracts fields, updates conversation state, and returns formatted completion.
-    """
-    body = await request.json()
-    messages: List[Dict[str, Any]] = body.get("messages", [])
-    conversation_id = body.get("conversation_id", body.get("channel_name", "default_demo"))
-    stream = body.get("stream", True)
-
-    state = get_or_create_conversation(conversation_id)
-
-    # Extract user's latest text message
-    user_messages = [m for m in messages if m.get("role") == "user"]
-    if user_messages:
-        latest_text = user_messages[-1].get("content", "")
-        extract_fields_from_text(latest_text, state)
-
-    reply_text = generate_next_response(state)
-    completion_id = f"chatcmpl-{uuid.uuid4()}"
-    created_time = int(time.time())
-
-    if stream:
-        async def sse_generator():
-            chunk1 = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": "setu-voice-ai",
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply_text}, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(chunk1)}\n\n"
-            chunk2 = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": "setu-voice-ai",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            }
-            yield f"data: {json.dumps(chunk2)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(sse_generator(), media_type="text/event-stream")
-
-    return {
-        "id": completion_id,
-        "object": "chat.completion",
-        "created": created_time,
-        "model": "setu-voice-ai",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": reply_text},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
-    }
-
-
+# Tool 1 Endpoint: create_ticket
 @app.post("/tools/create_ticket")
 @app.post("/api/tools/create_ticket")
 @app.post("/create_ticket")
 async def create_ticket_endpoint(request: Request):
-    """Tool execution endpoint called when create_ticket function is invoked."""
+    """
+    Tool endpoint called when Agora Conversational AI invokes create_ticket.
+    """
     body = await request.json()
+
+    # Unwrap arguments if wrapped in OpenAI/MCP function call format
     if "arguments" in body:
         args = body["arguments"]
         if isinstance(args, str):
@@ -396,11 +267,46 @@ async def create_ticket_endpoint(request: Request):
         body = body["parameters"]
 
     try:
-        ticket_req = TicketCreateRequest(**body)
+        ticket_req = CreateTicketRequest(**body)
     except Exception as e:
-        return {"success": False, "error": "INVALID_REQUEST_FORMAT", "message": str(e)}
+        return {
+            "success": False,
+            "error": "invalid_request_format",
+            "message": f"Missing or invalid parameters for create_ticket: {str(e)}"
+        }
 
     return execute_create_ticket(ticket_req)
+
+
+# Tool 2 Endpoint: transfer_to_human
+@app.post("/tools/transfer_to_human")
+@app.post("/api/tools/transfer_to_human")
+@app.post("/transfer_to_human")
+async def transfer_to_human_endpoint(request: Request):
+    """
+    Tool endpoint called when Agora Conversational AI invokes transfer_to_human.
+    """
+    body = await request.json()
+
+    # Unwrap arguments if wrapped in OpenAI/MCP function call format
+    if "arguments" in body:
+        args = body["arguments"]
+        if isinstance(args, str):
+            args = json.loads(args)
+        body = args
+    elif "parameters" in body:
+        body = body["parameters"]
+
+    try:
+        transfer_req = TransferToHumanRequest(**body)
+    except Exception as e:
+        return {
+            "success": False,
+            "error": "invalid_request_format",
+            "message": f"Missing or invalid parameters for transfer_to_human: {str(e)}"
+        }
+
+    return execute_transfer_to_human(transfer_req)
 
 
 if __name__ == "__main__":
