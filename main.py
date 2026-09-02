@@ -4,6 +4,10 @@ import uuid
 
 app = FastAPI()
 
+@app.get("/")
+async def root():
+    return {"status": "Setu Voice AI is active and running!", "endpoint": "/v1/chat/completions"}
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
