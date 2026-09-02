@@ -1,80 +1,204 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
-from openai import OpenAI
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
 import os
-import json
+import re
+import requests
+import logging
 
-app = FastAPI()
+app = FastAPI(
+    title="Setu Municipal Helpline Backend",
+    description="Business logic, data validation, and Freshdesk ticket creation tools for Setu Voice AI",
+    version="2.0.0"
+)
 
-# OpenAI client configured with OPENAI_API_KEY from environment variables
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+logger = logging.getLogger("uvicorn.error")
 
-# Municipal helpline "Setu" system persona and rules
-SYSTEM_PROMPT = """
-   You are Setu, a calm multilingual voice assistant for a municipal helpline.
-   You understand Hindi and English and can switch between them mid-sentence,
-   matching whatever the caller uses.
+# Allowed issue types for municipal helpline demo
+ALLOWED_ISSUE_TYPES = {"water", "garbage", "electricity", "certificate", "other"}
 
-   Your job, in this priority order, is to collect:
-   1. Caller's phone number
-   2. Location / ward / area
-   3. Type of issue (water, garbage, electricity, certificate, other)
-   4. Brief description of the issue
+# 1. Clean Internal Conversation / Ticket Request Model
+class TicketCreateRequest(BaseModel):
+    phone: str = Field(..., description="10-digit Indian mobile number of caller")
+    location: str = Field(..., description="Location, ward, or area name")
+    issue_type: str = Field(..., description="Type of issue: water, garbage, electricity, certificate, other")
+    description: str = Field(..., description="Brief description of the issue")
+    confirmation_status: Optional[str] = Field("confirmed", description="Confirmation status from caller")
 
-   Rules you must always follow:
-   - Ask one question at a time. Do not ask for information already given.
-   - Before ending the call, repeat the phone number, location, and issue type
-     back to the caller and explicitly ask them to confirm it is correct.
-   - If you did not clearly understand an answer, say so and ask again once,
-     do not guess or make up details.
-   - If, after asking again, you are still unsure, or the caller's situation
-     needs human judgment, say you are connecting them to a human agent.
-   - You must NEVER give medical, legal, financial, or emergency advice of any
-     kind, even if asked directly. If asked, say clearly that you cannot help
-     with that and that you will connect them to a human agent instead.
-   - Keep your responses short and natural, like a real phone call.
-"""
+
+def validate_indian_phone(phone: str) -> tuple[bool, str]:
+    """
+    Validates an Indian 10-digit mobile number.
+    Accepts formats: 9876543210, +919876543210, 919876543210, 09876543210.
+    Returns (is_valid, cleaned_10_digit_phone)
+    """
+    if not phone or not isinstance(phone, str):
+        return False, ""
+
+    # Remove spaces, hyphens, parentheses
+    cleaned = re.sub(r"[\s\-\(\)]", "", phone.strip())
+
+    # Strip leading country code prefixes
+    if cleaned.startswith("+91"):
+        cleaned = cleaned[3:]
+    elif cleaned.startswith("91") and len(cleaned) == 12:
+        cleaned = cleaned[2:]
+    elif cleaned.startswith("0") and len(cleaned) == 11:
+        cleaned = cleaned[1:]
+
+    # Verify exactly 10 digits starting with digits 6, 7, 8, or 9
+    if re.match(r"^[6-9]\d{9}$", cleaned):
+        return True, cleaned
+
+    return False, ""
+
+
+def validate_issue_type(issue_type: str) -> tuple[bool, str]:
+    """Validates issue_type against allowed demo values."""
+    if not issue_type or not isinstance(issue_type, str):
+        return False, ""
+
+    normalized = issue_type.strip().lower()
+    if normalized in ALLOWED_ISSUE_TYPES:
+        return True, normalized
+    return False, normalized
+
+
+def execute_create_ticket(data: TicketCreateRequest) -> Dict[str, Any]:
+    """
+    Validates parameters and creates a real ticket in Freshdesk.
+    """
+    # 1. Validate Phone Number
+    phone_valid, clean_phone = validate_indian_phone(data.phone)
+    if not phone_valid:
+        return {
+            "success": False,
+            "error": "INVALID_PHONE_NUMBER",
+            "message": f"'{data.phone}' is not a valid 10-digit Indian mobile number. Must be a 10-digit number starting with 6, 7, 8, or 9."
+        }
+
+    # 2. Validate Issue Type
+    issue_valid, clean_issue_type = validate_issue_type(data.issue_type)
+    if not issue_valid:
+        return {
+            "success": False,
+            "error": "INVALID_ISSUE_TYPE",
+            "message": f"'{data.issue_type}' is not a recognized issue type. Allowed values are: water, garbage, electricity, certificate, other."
+        }
+
+    # 3. Read Freshdesk Credentials from Environment Variables
+    raw_domain = os.environ.get("FRESHDESK_DOMAIN", "").strip()
+    freshdesk_key = os.environ.get("FRESHDESK_API_KEY", "").strip()
+
+    if not raw_domain or not freshdesk_key:
+        logger.error("Freshdesk credentials missing in environment variables.")
+        return {
+            "success": False,
+            "error": "FRESHDESK_CONFIG_MISSING",
+            "message": "Freshdesk credentials (FRESHDESK_DOMAIN or FRESHDESK_API_KEY) are not configured on the Setu backend server."
+        }
+
+    # Clean domain URL
+    freshdesk_domain = raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
+    if not freshdesk_domain.endswith(".freshdesk.com"):
+        freshdesk_domain = f"{freshdesk_domain}.freshdesk.com"
+
+    freshdesk_url = f"https://{freshdesk_domain}/api/v2/tickets"
+
+    payload = {
+        "subject": f"Municipal Helpline [{clean_issue_type.upper()}]: Reported in {data.location.strip()}",
+        "description": f"Phone: {clean_phone}\nLocation: {data.location.strip()}\nIssue Type: {clean_issue_type}\nDescription: {data.description.strip()}\nStatus: Confirmed by caller",
+        "email": f"caller_{clean_phone}@setu-helpline.local",
+        "phone": clean_phone,
+        "priority": 1,
+        "status": 2
+    }
+
+    try:
+        response = requests.post(
+            freshdesk_url,
+            json=payload,
+            auth=(freshdesk_key, "X"),
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+
+        if response.status_code == 201:
+            ticket_data = response.json()
+            ticket_id = ticket_data.get("id")
+            logger.info(f"Freshdesk ticket #{ticket_id} created successfully for phone {clean_phone}")
+            return {
+                "success": True,
+                "ticket_id": ticket_id,
+                "message": f"Complaint successfully registered in Freshdesk with Ticket ID #{ticket_id}.",
+                "data": {
+                    "ticket_id": ticket_id,
+                    "phone": clean_phone,
+                    "location": data.location.strip(),
+                    "issue_type": clean_issue_type,
+                    "description": data.description.strip()
+                }
+            }
+        else:
+            logger.error(f"Freshdesk API error {response.status_code}: {response.text}")
+            return {
+                "success": False,
+                "error": "FRESHDESK_API_ERROR",
+                "message": f"Freshdesk returned status code {response.status_code}: {response.text}"
+            }
+
+    except Exception as e:
+        logger.exception("Failed to connect to Freshdesk API")
+        return {
+            "success": False,
+            "error": "FRESHDESK_CONNECTION_FAILED",
+            "message": f"Connection to Freshdesk failed: {str(e)}"
+        }
+
 
 @app.get("/")
 async def root():
-    return {"status": "Setu Voice AI is active and running!"}
+    return {
+        "status": "Setu Business Logic & Freshdesk Integration Backend is active!",
+        "architecture": "Agora Conversational AI Tool Execution Backend",
+        "endpoints": ["/tools/create_ticket", "/health"]
+    }
 
-@app.get("/v1/chat/completions")
-async def chat_get():
-    return {"message": "Endpoint is active. Waiting for POST requests."}
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+# 2. Tool / Function Execution Endpoint
+@app.post("/tools/create_ticket")
+@app.post("/api/tools/create_ticket")
+@app.post("/create_ticket")
+async def create_ticket_endpoint(request: Request):
+    """
+    Tool/function endpoint called when Agora Conversational AI invokes create_ticket.
+    Supports direct JSON bodies and function call wrapper payloads.
+    """
     body = await request.json()
-    messages = body.get("messages", [])
-    stream = body.get("stream", True)
 
-    # Insert Setu persona system prompt at the beginning of message history
-    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    # Handle wrapper formats if parameters arrive wrapped inside 'arguments' or 'parameters'
+    if "arguments" in body:
+        args = body["arguments"]
+        if isinstance(args, str):
+            import json
+            args = json.loads(args)
+        body = args
+    elif "parameters" in body:
+        body = body["parameters"]
 
-    # Handle real-time SSE streaming for voice audio generation
-    if stream:
-        def gpt_stream_generator():
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=full_messages,
-                max_tokens=150,
-                stream=True
-            )
-            for chunk in response:
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-            yield "data: [DONE]\n\n"
+    try:
+        ticket_req = TicketCreateRequest(**body)
+    except Exception as e:
+        return {
+            "success": False,
+            "error": "INVALID_REQUEST_FORMAT",
+            "message": f"Missing or invalid parameters: {str(e)}"
+        }
 
-        return StreamingResponse(gpt_stream_generator(), media_type="text/event-stream")
-
-    # Non-streaming fallback
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=full_messages,
-        max_tokens=150,
-        stream=False
-    )
-    return response.model_dump()
+    return execute_create_ticket(ticket_req)
 
 if __name__ == "__main__":
     import uvicorn
