@@ -26,29 +26,38 @@ class TicketCreateRequest(BaseModel):
     confirmation_status: Optional[str] = Field("confirmed", description="Confirmation status from caller")
 
 
+WORD_TO_DIGIT = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
+}
+
 def validate_indian_phone(phone: str) -> tuple[bool, str]:
     """
     Validates an Indian 10-digit mobile number.
-    Accepts formats: 9876543210, +919876543210, 919876543210, 09876543210.
+    Accepts numeric strings and spoken word formats (e.g., 'seven eight78331909').
     Returns (is_valid, cleaned_10_digit_phone)
     """
     if not phone or not isinstance(phone, str):
         return False, ""
 
-    # Remove spaces, hyphens, parentheses
-    cleaned = re.sub(r"[\s\-\(\)]", "", phone.strip())
+    text = phone.lower().strip()
+
+    # Replace word numbers with digits
+    for word, digit in WORD_TO_DIGIT.items():
+        text = re.sub(r'\b' + word + r'\b', digit, text)
+
+    # Extract all digits
+    digits = "".join(re.findall(r"\d", text))
 
     # Strip leading country code prefixes
-    if cleaned.startswith("+91"):
-        cleaned = cleaned[3:]
-    elif cleaned.startswith("91") and len(cleaned) == 12:
-        cleaned = cleaned[2:]
-    elif cleaned.startswith("0") and len(cleaned) == 11:
-        cleaned = cleaned[1:]
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    elif digits.startswith("0") and len(digits) == 11:
+        digits = digits[1:]
 
     # Verify exactly 10 digits starting with digits 6, 7, 8, or 9
-    if re.match(r"^[6-9]\d{9}$", cleaned):
-        return True, cleaned
+    if re.match(r"^[6-9]\d{9}$", digits):
+        return True, digits
 
     return False, ""
 
