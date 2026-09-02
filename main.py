@@ -116,18 +116,15 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
         state["phone"] = clean_phone
         state["phone_confidence"] = "high"
     elif len(clean_phone) > 0 and state["phone_confidence"] != "high":
-        # Partial phone number given
         state["phone_confidence"] = "low"
 
     # 2. Extract Location
-    # Look for location keywords or direct answers when phone is already collected
     location_match = re.search(r"\b(ward\s*\d+|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+|block\s*[a-z0-9]+)\b", lowered)
     if location_match:
         state["location"] = location_match.group(0).title()
         state["location_confidence"] = "high"
-    elif state["phone_confidence"] == "high" and state["location_confidence"] != "high":
-        # If phone is known and user gives a short location response
-        if len(text) >= 3 and not any(k in lowered for k in ["water", "electricity", "garbage", "certificate", "yes", "no", "hello"]):
+    elif state["phone_confidence"] == "high" and state["location_confidence"] != "high" and not is_valid_phone:
+        if len(text) >= 3 and not re.search(r"^\d+$", "".join(re.findall(r"\d", text))) and not any(k in lowered for k in ["water", "electricity", "garbage", "certificate", "yes", "no", "hello"]):
             state["location"] = text.title()
             state["location_confidence"] = "high"
 
@@ -147,14 +144,13 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
 
     # 4. Extract Description
     if state["phone_confidence"] == "high" and state["location_confidence"] == "high" and state["issue_type_confidence"] == "high":
-        if state["description_confidence"] != "high":
-            # Exclude short confirmations
-            if lowered not in ["yes", "no", "hello", "ok", "correct", "confirm"]:
+        if lowered not in ["yes", "no", "hello", "ok", "correct", "confirm", "haan", "ha", "yes, correct"]:
+            if not is_valid_phone and not location_match:
                 state["description"] = text
                 state["description_confidence"] = "high"
 
     # 5. Handle Confirmation
-    if lowered in ["yes", "correct", "true", "confirm", "haan", "haa", "ha"]:
+    if lowered in ["yes", "correct", "true", "confirm", "haan", "haa", "ha", "yes correct", "yes, correct"]:
         if (state["phone_confidence"] == "high" and
             state["location_confidence"] == "high" and
             state["issue_type_confidence"] == "high" and
