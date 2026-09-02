@@ -168,6 +168,27 @@ async def root():
 async def health():
     return {"status": "ok"}
 
+@app.get("/v1/chat/completions")
+async def chat_get():
+    return {"message": "Setu Supporting Backend is active. Tools available at /tools/create_ticket"}
+
+@app.post("/v1/chat/completions")
+async def chat_completions_fallback(request: Request):
+    """
+    Fallback handler if Agora or a client calls /v1/chat/completions.
+    Checks if it is a tool execution request or returns a status message.
+    """
+    body = await request.json()
+
+    # If a tool call arrived via function call format
+    if "phone" in body or "arguments" in body or "parameters" in body:
+        return await create_ticket_endpoint(request)
+
+    return {
+        "status": "Setu Business Logic Server",
+        "message": "Agora Conversational AI is running in Managed Mode. Tools are available at /tools/create_ticket."
+    }
+
 # 2. Tool / Function Execution Endpoint
 @app.post("/tools/create_ticket")
 @app.post("/api/tools/create_ticket")
