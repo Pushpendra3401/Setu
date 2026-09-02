@@ -8,6 +8,10 @@ app = FastAPI()
 async def root():
     return {"status": "Setu Voice AI is active and running!", "endpoint": "/v1/chat/completions"}
 
+@app.get("/v1/chat/completions")
+async def chat_get():
+    return {"message": "This endpoint is for Agora to send VOICE data via POST. It is working correctly!"}
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
