@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Setu Municipal Helpline — Human Escalation Console</title>
+  <!-- Agora RTM v2 SDK -->
+  <script src="https://cdn.jsdelivr.net/npm/agora-rtm-sdk@2.2.0/index.js"></script>
+  <style>
+    :root {
+      --bg-color: #0f172a;
+      --card-bg: #1e293b;
+      --border-color: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-red: #ef4444;
+      --accent-amber: #f59e0b;
+      --accent-blue: #3b82f6;
+      --accent-green: #10b981;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg-color);
+      color: var(--text-main);
+      margin: 0;
+      padding: 20px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      max-width: 900px;
+      margin: 0 auto 20px auto;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .header h1 {
+      font-size: 20px;
+      font-weight: 700;
+      margin: 0;
+    }
+
+    .badge-channel {
+      background-color: #1e293b;
+      border: 1px solid var(--border-color);
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      color: var(--accent-green);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--accent-green);
+      display: inline-block;
+    }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text-muted);
+      border: 2px dashed var(--border-color);
+      border-radius: 12px;
+    }
+
+    .card {
+      background-color: var(--card-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 18px 20px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+      position: relative;
+    }
+
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 10px;
+    }
+
+    .reason-badge {
+      background-color: rgba(239, 68, 68, 0.15);
+      color: var(--accent-red);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .timestamp {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .issue-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-main);
+      margin-bottom: 12px;
+    }
+
+    .grid-fields {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      background-color: #0f172a;
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .field-item {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .field-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      font-weight: 600;
+      margin-bottom: 2px;
+    }
+
+    .field-val {
+      font-size: 13px;
+      font-weight: 600;
+      color: #e2e8f0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .field-val.missing {
+      color: var(--accent-amber);
+      font-style: italic;
+    }
+
+    .section-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      font-weight: 700;
+      margin-top: 10px;
+      margin-bottom: 4px;
+    }
+
+    .section-body {
+      font-size: 13px;
+      line-height: 1.4;
+      color: #cbd5e1;
+      margin: 0;
+    }
+
+    .unresolved-box {
+      background-color: rgba(245, 158, 11, 0.1);
+      border-left: 3px solid var(--accent-amber);
+      padding: 8px 12px;
+      border-radius: 4px;
+      margin-top: 10px;
+    }
+
+    .unresolved-box .section-title {
+      color: var(--accent-amber);
+      margin-top: 0;
+    }
+
+    .unresolved-box .section-body {
+      color: #fde68a;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>🏛️ Setu Municipal Helpline — Human Escalation Console</h1>
+    <div class="badge-channel" id="status-badge">
+      <span class="dot"></span>
+      <span id="status-text">Connected: channel 'human-escalations'</span>
+    </div>
+  </div>
+
+  <div class="container" id="cards-container">
+    <div class="empty-state" id="empty-state">
+      <p>No human escalations yet. Waiting for live calls from channel <code>human-escalations</code>...</p>
+    </div>
+  </div>
+
+  <script>
+    const cardsContainer = document.getElementById("cards-container");
+    const emptyState = document.getElementById("empty-state");
+    const seenIds = new Set();
+
+    function renderEscalationCard(data) {
+      if (!data || !data.reason) return;
+      const cardId = data.id || `esc-${Date.now()}-${Math.random()}`;
+      if (seenIds.has(cardId)) return;
+      seenIds.add(cardId);
+
+      if (emptyState) emptyState.style.display = "none";
+
+      const confirmed = data.confirmed_fields || {};
+      const timestamp = data.timestamp || new Date().toLocaleTimeString();
+
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `
+        <div class="card-top">
+          <span class="reason-badge">⚠️ ${escapeHtml(data.reason)}</span>
+          <span class="timestamp">${escapeHtml(timestamp)}</span>
+        </div>
+
+        <div class="issue-title">📋 ${escapeHtml(data.issue_one_line || "Issue Escalated")}</div>
+
+        <div class="grid-fields">
+          <div class="field-item">
+            <span class="field-label">Phone</span>
+            <span class="field-val ${!confirmed.phone ? 'missing' : ''}">${escapeHtml(confirmed.phone || 'Unconfirmed')}</span>
+          </div>
+          <div class="field-item">
+            <span class="field-label">Location</span>
+            <span class="field-val ${!confirmed.location ? 'missing' : ''}">${escapeHtml(confirmed.location || 'Unconfirmed')}</span>
+          </div>
+          <div class="field-item">
+            <span class="field-label">Issue Type</span>
+            <span class="field-val ${!confirmed.issue_type ? 'missing' : ''}">${escapeHtml(confirmed.issue_type || 'Unconfirmed')}</span>
+          </div>
+          <div class="field-item">
+            <span class="field-label">Description</span>
+            <span class="field-val ${!confirmed.description ? 'missing' : ''}">${escapeHtml(confirmed.description || 'Unconfirmed')}</span>
+          </div>
+        </div>
+
+        <div class="section-title">Key Conversation Points</div>
+        <p class="section-body">${escapeHtml(data.key_points || 'None')}</p>
+
+        <div class="unresolved-box">
+          <div class="section-title">Why Human Help Is Needed</div>
+          <p class="section-body">${escapeHtml(data.unresolved || 'None')}</p>
+        </div>
+      `;
+
+      cardsContainer.prepend(card);
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    // Auto-poll fallback to ensure instant rendering across all environments
+    async function pollEscalations() {
+      try {
+        const res = await fetch("/api/escalations");
+        if (res.ok) {
+          const items = await res.json();
+          if (Array.isArray(items)) {
+            items.forEach(renderEscalationCard);
+          }
+        }
+      } catch (err) {
+        console.warn("Poll escalations error:", err);
+      }
+    }
+
+    setInterval(pollEscalations, 2000);
+    pollEscalations();
+  </script>
+</body>
+</html>

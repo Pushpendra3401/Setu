@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import os
@@ -7,13 +7,12 @@ import re
 import requests
 import json
 import time
-import uuid
 import logging
 
 app = FastAPI(
     title="Setu Municipal Helpline Backend Tools",
     description="Backend tool execution server providing create_ticket and transfer_to_human for Setu Voice AI",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 logger = logging.getLogger("uvicorn.error")
@@ -26,6 +25,9 @@ WORD_TO_DIGIT = {
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
 }
 
+# In-memory storage for structured human escalations
+escalations_list: List[Dict[str, Any]] = []
+
 # ------------------------------------------------------------------------------
 # Pydantic Request Models for Backend Tools
 # ------------------------------------------------------------------------------
@@ -37,8 +39,11 @@ class CreateTicketRequest(BaseModel):
 
 
 class TransferToHumanRequest(BaseModel):
-    reason: str = Field(..., description="Reason for escalating to a human agent")
-    summary: str = Field(..., description="Brief summary of conversation state and caller situation")
+    reason: str = Field(..., description="One phrase explaining why this call is escalating")
+    issue_one_line: str = Field(..., description="One line summary of the issue")
+    confirmed_fields: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Dictionary of locked-in fields")
+    key_points: str = Field(..., description="2-3 sentences max detailing what was discussed without filler")
+    unresolved: str = Field(..., description="What is uncertain and specifically why a human agent is needed")
 
 
 # ------------------------------------------------------------------------------
@@ -192,41 +197,59 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# Tool 2: transfer_to_human Implementation
+# Tool 2: transfer_to_human Implementation (Structured Escalation)
 # ------------------------------------------------------------------------------
 def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
     """
-    Validates parameters, logs the human escalation clearly to the console, and returns success.
+    Validates structured transfer_to_human parameters, logs clearly to server console,
+    stores the escalation for console.html, and returns success.
     """
     clean_reason = data.reason.strip() if data.reason else ""
-    clean_summary = data.summary.strip() if data.summary else ""
+    clean_issue_one_line = data.issue_one_line.strip() if data.issue_one_line else ""
+    clean_key_points = data.key_points.strip() if data.key_points else ""
+    clean_unresolved = data.unresolved.strip() if data.unresolved else ""
+    confirmed_fields = data.confirmed_fields or {}
 
     if not clean_reason:
-        return {
-            "success": False,
-            "error": "invalid_reason",
-            "message": "Reason parameter cannot be empty."
-        }
+        return {"success": False, "error": "invalid_reason", "message": "Reason parameter cannot be empty."}
 
-    if not clean_summary:
-        return {
-            "success": False,
-            "error": "invalid_summary",
-            "message": "Summary parameter cannot be empty."
-        }
+    if not clean_issue_one_line:
+        return {"success": False, "error": "invalid_issue_one_line", "message": "Issue one-line parameter cannot be empty."}
 
-    # Console Logging
+    if not clean_key_points:
+        return {"success": False, "error": "invalid_key_points", "message": "Key points parameter cannot be empty."}
+
+    if not clean_unresolved:
+        return {"success": False, "error": "invalid_unresolved", "message": "Unresolved parameter cannot be empty."}
+
+    escalation_entry = {
+        "id": f"esc-{int(time.time())}",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "reason": clean_reason,
+        "issue_one_line": clean_issue_one_line,
+        "confirmed_fields": confirmed_fields,
+        "key_points": clean_key_points,
+        "unresolved": clean_unresolved
+    }
+
+    # Store in memory for console.html
+    escalations_list.append(escalation_entry)
+
+    # Crisp Structured Console Logging
     print("\n========== HUMAN ESCALATION ==========")
-    print(f"Reason:  {clean_reason}")
-    print(f"Summary: {clean_summary}")
+    print(f"Reason:          {clean_reason}")
+    print(f"Issue One-Line:  {clean_issue_one_line}")
+    print(f"Confirmed Fields:{json.dumps(confirmed_fields)}")
+    print(f"Key Points:      {clean_key_points}")
+    print(f"Unresolved:      {clean_unresolved}")
     print("=======================================\n")
 
-    logger.info(f"HUMAN ESCALATION | Reason: {clean_reason} | Summary: {clean_summary}")
+    logger.info(f"HUMAN ESCALATION | Reason: {clean_reason} | Issue: {clean_issue_one_line}")
 
     return {
         "success": True,
         "status": "human_escalation_requested",
-        "message": "Human escalation request logged successfully."
+        "message": "Human escalation logged and published successfully."
     }
 
 
@@ -238,13 +261,31 @@ async def root():
     return {
         "status": "Setu Supporting Tools Backend is active!",
         "architecture": "Agora Conversational AI Backend Tool Execution Server",
-        "tools": ["create_ticket", "transfer_to_human"]
+        "tools": ["create_ticket", "transfer_to_human"],
+        "console_url": "/console"
     }
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/console", response_class=HTMLResponse)
+@app.get("/console.html", response_class=HTMLResponse)
+async def serve_console():
+    """Serves the Human Escalation Console HTML page."""
+    console_path = os.path.join(os.path.dirname(__file__), "console.html")
+    if os.path.exists(console_path):
+        with open(console_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return "<h1>Console file not found</h1>"
+
+
+@app.get("/api/escalations")
+async def get_escalations():
+    """Returns list of all structured escalations for console.html."""
+    return escalations_list
 
 
 # Tool 1 Endpoint: create_ticket
