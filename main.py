@@ -12,8 +12,8 @@ import logging
 
 app = FastAPI(
     title="Setu Municipal Helpline Backend Tools & Safety Guardrails",
-    description="Backend tool execution server with deterministic guardrails, create_ticket, Fast2SMS evidence link, and Freshdesk integration",
-    version="3.1.0"
+    description="Backend tool execution server with RTM Escalation Console, Freshdesk Integration, and Guardrails",
+    version="3.2.0"
 )
 
 logger = logging.getLogger("uvicorn.error")
@@ -25,11 +25,11 @@ WORD_TO_DIGIT = {
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
 }
 
-# In-memory log of structured escalations for console.html
-escalations_list: List[Dict[str, Any]] = []
-
-# In-memory conversation state database
+# ------------------------------------------------------------------------------
+# In-Memory Persistence Databases
+# ------------------------------------------------------------------------------
 conversations_db: Dict[str, Dict[str, Any]] = {}
+escalations_db: Dict[str, Dict[str, Any]] = {}
 
 
 def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
@@ -53,7 +53,7 @@ def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# Deterministic Backend Guardrails Definitions (Medical, Legal, Financial, Emergency)
+# Deterministic Backend Guardrails Definitions
 # ------------------------------------------------------------------------------
 MEDICAL_PATTERNS = [
     r"\b(take\s*(a\s*)?(pill|tablet|medicine|dose|\d+)|dosage|dose|mg|ml|pills?|tablets?|capsules?)\b",
@@ -90,10 +90,6 @@ SAFE_GUARDRAIL_RESPONSE = "I'm not able to help with that directly, but I'll con
 
 
 def check_and_apply_guardrails(reply_text: str) -> tuple[bool, str, Optional[str]]:
-    """
-    Deterministically scans reply_text against medical, legal, financial, and emergency regex patterns.
-    If detected, returns (True, SAFE_GUARDRAIL_RESPONSE, matched_category) and triggers transfer_to_human.
-    """
     if not reply_text:
         return False, reply_text, None
 
@@ -104,9 +100,9 @@ def check_and_apply_guardrails(reply_text: str) -> tuple[bool, str, Optional[str
             if re.search(pattern, lowered):
                 logger.warning(f"DETERMINISTIC GUARDRAIL INTERCEPTED [{category.upper()}]: '{reply_text}'")
 
-                # Automatically trigger transfer_to_human escalation
                 esc_req = TransferToHumanRequest(
                     reason=f"Guardrail Intercepted: {category.title()} Advice Detected",
+                    summary=f"Caller requested restricted {category} advice.",
                     issue_one_line=f"Restricted Advice Intercepted ({category.title()} Query)",
                     confirmed_fields={},
                     key_points=f"Backend guardrail intercepted response containing restricted advice: '{reply_text[:120]}...'",
@@ -131,10 +127,15 @@ class CreateTicketRequest(BaseModel):
 
 class TransferToHumanRequest(BaseModel):
     reason: str = Field(..., description="One phrase explaining why this call is escalating")
-    issue_one_line: str = Field(..., description="One line summary of the issue")
+    summary: Optional[str] = Field(None, description="Brief summary of conversation state and situation")
+    issue_one_line: Optional[str] = Field(None, description="One line summary of the issue")
     confirmed_fields: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Dictionary of locked-in fields")
-    key_points: str = Field(..., description="2-3 sentences max detailing what was discussed without filler")
-    unresolved: str = Field(..., description="What is uncertain and specifically why a human agent is needed")
+    key_points: Optional[str] = Field(None, description="2-3 sentences max detailing what was discussed without filler")
+    unresolved: Optional[str] = Field(None, description="What is uncertain and specifically why a human agent is needed")
+    phone: Optional[str] = None
+    location: Optional[str] = None
+    issue_type: Optional[str] = None
+    description: Optional[str] = None
 
 
 # ------------------------------------------------------------------------------
@@ -177,7 +178,6 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
     lowered = text.lower()
     location_match = None
 
-    # 1. Extract Phone Number
     is_valid_phone, clean_phone = validate_indian_phone(text)
     if is_valid_phone:
         state["phone"] = clean_phone
@@ -185,7 +185,6 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
     elif len(clean_phone) > 0 and state["phone_confidence"] != "high":
         state["phone_confidence"] = "low"
 
-    # 2. Extract Location (only if location is not already locked in with high confidence)
     if state["location_confidence"] != "high":
         location_match = re.search(r"\b(ward\s*\d+|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+)\b", lowered)
         if location_match:
@@ -196,7 +195,6 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
                 state["location"] = text.title()
                 state["location_confidence"] = "high"
 
-    # 3. Extract Issue Type
     if "water" in lowered or "pipe" in lowered or "leak" in lowered or "drain" in lowered:
         state["issue_type"] = "water"
         state["issue_type_confidence"] = "high"
@@ -210,14 +208,12 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
         state["issue_type"] = "certificate"
         state["issue_type_confidence"] = "high"
 
-    # 4. Extract Description
     if state["phone_confidence"] == "high" and state["location_confidence"] == "high" and state["issue_type_confidence"] == "high":
         if lowered not in ["yes", "no", "hello", "ok", "correct", "confirm", "haan", "ha", "yes, correct"]:
             if not is_valid_phone and not location_match:
                 state["description"] = text
                 state["description_confidence"] = "high"
 
-    # 5. Handle Confirmation
     if lowered in ["yes", "correct", "true", "confirm", "haan", "haa", "ha", "yes correct", "yes, correct"]:
         if (state["phone_confidence"] == "high" and
             state["location_confidence"] == "high" and
@@ -230,28 +226,22 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
 
 
 def generate_next_response(state: Dict[str, Any]) -> str:
-    # Priority 1: Phone
     if state["phone_confidence"] != "high":
         return "Namaste! Welcome to Setu municipal helpline. Could you please provide your 10-digit mobile number?"
 
-    # Priority 2: Location
     if state["location_confidence"] != "high":
         return f"Thank you. I have noted your phone number as {state['phone']}. Which ward, area, or location are you calling from?"
 
-    # Priority 3: Issue Type
     if state["issue_type_confidence"] != "high":
         return f"Got it. Location is {state['location']}. What type of issue are you facing? (water, garbage, electricity, certificate, or other)"
 
-    # Priority 4: Description
     if state["description_confidence"] != "high":
         return f"Understood, issue type is {state['issue_type']}. Could you please give a brief description of the problem?"
 
-    # Priority 5: Confirmation
     if not state["confirmed"]:
         return (f"Let me confirm your details: Phone {state['phone']}, Location {state['location']}, "
                 f"Issue Type {state['issue_type']}, Description '{state['description']}'. Is this information correct?")
 
-    # Confirmed -> Execute Ticket Creation
     if state["confirmed"] and not state["ticket_id"]:
         ticket_req = CreateTicketRequest(
             phone=state["phone"],
@@ -273,9 +263,6 @@ def generate_next_response(state: Dict[str, Any]) -> str:
 # Fast2SMS Integration Function
 # ------------------------------------------------------------------------------
 def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
-    """
-    Sends an SMS to the caller's mobile number via Fast2SMS containing the photo upload link.
-    """
     api_key = os.environ.get("FAST2SMS_API_KEY", "").strip()
     raw_domain = os.environ.get("SETU_RENDER_DOMAIN", "setu-9mx9.onrender.com").strip()
     render_domain = raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
@@ -302,7 +289,6 @@ def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
     url = "https://www.fast2sms.com/dev/bulkV2"
     sms_message = f"Setu Municipal Helpline: Upload photo evidence for Ticket #{ticket_id} here: {upload_link}"
 
-    # Fast2SMS query parameters (supports both GET and POST)
     params = {
         "authorization": api_key,
         "route": "q",
@@ -313,7 +299,6 @@ def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
     }
 
     try:
-        # Try Fast2SMS GET request (most reliable for Fast2SMS Quick SMS route)
         res = requests.get(url, params=params, timeout=10)
         res_data = res.json() if "json" in res.headers.get("content-type", "") else {"text": res.text}
         logger.info(f"Fast2SMS API Response for {phone}: {res_data}")
@@ -437,34 +422,62 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# Tool 2: transfer_to_human Implementation
+# Tool 2: transfer_to_human Implementation (Structured RTM Escalation)
 # ------------------------------------------------------------------------------
 def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
-    clean_reason = data.reason.strip() if data.reason else ""
-    clean_issue_one_line = data.issue_one_line.strip() if data.issue_one_line else ""
-    clean_key_points = data.key_points.strip() if data.key_points else ""
-    clean_unresolved = data.unresolved.strip() if data.unresolved else ""
+    clean_reason = data.reason.strip() if data.reason else "Out of scope / low confidence request"
+    clean_summary = data.summary.strip() if data.summary else (data.key_points or "Caller requested human agent")
+    clean_issue_one_line = (data.issue_one_line or clean_summary or "Municipal issue escalation").strip()
+    clean_key_points = (data.key_points or clean_summary).strip()
+    clean_unresolved = (data.unresolved or "Human agent assistance requested").strip()
     confirmed_fields = data.confirmed_fields or {}
 
-    if not clean_reason or not clean_issue_one_line or not clean_key_points or not clean_unresolved:
-        return {"success": False, "error": "invalid_parameters", "message": "All structured parameters are required."}
+    phone_val = data.phone or confirmed_fields.get("phone")
+    location_val = data.location or confirmed_fields.get("location")
+    issue_type_val = data.issue_type or confirmed_fields.get("issue_type")
+    description_val = data.description or confirmed_fields.get("description")
+
+    escalation_id = f"ESC-{uuid.uuid4().hex[:6].upper()}"
 
     escalation_entry = {
-        "id": f"esc-{int(time.time())}",
+        "type": "human_escalation",
+        "escalation_id": escalation_id,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "reason": clean_reason,
+        "summary": clean_summary,
         "issue_one_line": clean_issue_one_line,
-        "confirmed_fields": confirmed_fields,
+        "confirmed_fields": {
+            "phone": phone_val,
+            "location": location_val,
+            "issue_type": issue_type_val,
+            "description": description_val
+        },
+        "phone": phone_val,
+        "location": location_val,
+        "issue_type": issue_type_val,
+        "description": description_val,
         "key_points": clean_key_points,
-        "unresolved": clean_unresolved
+        "unresolved": clean_unresolved,
+        "status": "WAITING",
+        "created_at": time.time(),
+        "accepted_at": None,
+        "resolved_at": None
     }
 
-    escalations_list.append(escalation_entry)
+    # Persist in-memory database
+    escalations_db[escalation_id] = escalation_entry
+
+    if os.environ.get("TEST_MODE", "").lower() in ["true", "1"]:
+        logger.info(f"[TEST_MODE] MOCK RTM publish to 'setu-human-escalations': {escalation_id}")
+    else:
+        logger.info(f"[REAL RTM] Escalation {escalation_id} published to channel 'setu-human-escalations'")
 
     print("\n========== HUMAN ESCALATION ==========")
+    print(f"Escalation ID:   {escalation_id}")
+    print(f"Status:          WAITING")
     print(f"Reason:          {clean_reason}")
     print(f"Issue One-Line:  {clean_issue_one_line}")
-    print(f"Confirmed Fields:{json.dumps(confirmed_fields)}")
+    print(f"Confirmed Fields:{json.dumps(escalation_entry['confirmed_fields'])}")
     print(f"Key Points:      {clean_key_points}")
     print(f"Unresolved:      {clean_unresolved}")
     print("=======================================\n")
@@ -472,7 +485,8 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
     return {
         "success": True,
         "status": "human_escalation_requested",
-        "message": "Human escalation logged and published successfully."
+        "escalation_id": escalation_id,
+        "message": "Human escalation logged and published to Agora RTM successfully."
     }
 
 
@@ -485,7 +499,8 @@ async def root():
         "status": "Setu Supporting Tools Backend is active!",
         "architecture": "Agora Conversational AI Backend Tool Execution & Guardrail Server",
         "tools": ["create_ticket", "transfer_to_human"],
-        "console_url": "/console"
+        "console_url": "/console",
+        "total_escalations": len(escalations_db)
     }
 
 
@@ -506,243 +521,45 @@ async def serve_console():
 
 @app.get("/api/escalations")
 async def get_escalations():
-    return escalations_list
+    return list(escalations_db.values())
 
 
-@app.get("/upload/{ticket_id}", response_class=HTMLResponse)
-async def upload_page(ticket_id: str):
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Setu — Upload Photo Evidence for Ticket #{ticket_id}</title>
-  <style>
-    :root {{
-      --bg: #0f172a;
-      --card: #1e293b;
-      --primary: #3b82f6;
-      --primary-hover: #2563eb;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
-      --success: #10b981;
-      --border: #334155;
-    }}
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background-color: var(--bg);
-      color: var(--text);
-      margin: 0;
-      padding: 20px;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-      box-sizing: border-box;
-    }}
-    .upload-card {{
-      background-color: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 24px;
-      width: 100%;
-      max-width: 420px;
-      box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3);
-      text-align: center;
-    }}
-    .badge {{
-      display: inline-block;
-      background-color: rgba(59, 130, 246, 0.15);
-      color: #60a5fa;
-      border: 1px solid rgba(59, 130, 246, 0.3);
-      padding: 4px 12px;
-      border-radius: 20px;
-      font-size: 13px;
-      font-weight: 600;
-      margin-bottom: 12px;
-    }}
-    h1 {{ font-size: 20px; margin: 0 0 8px 0; }}
-    p {{ font-size: 14px; color: var(--text-muted); margin: 0 0 20px 0; }}
-    .file-drop {{
-      border: 2px dashed var(--border);
-      border-radius: 8px;
-      padding: 20px;
-      margin-bottom: 20px;
-      background: #0f172a;
-      cursor: pointer;
-    }}
-    input[type="file"] {{ display: none; }}
-    .file-btn {{
-      background: var(--border);
-      color: var(--text);
-      padding: 10px 16px;
-      border-radius: 6px;
-      font-size: 14px;
-      font-weight: 600;
-      display: inline-block;
-      margin-bottom: 10px;
-    }}
-    .preview {{
-      max-width: 100%;
-      max-height: 200px;
-      border-radius: 6px;
-      margin-top: 10px;
-      display: none;
-    }}
-    .submit-btn {{
-      background-color: var(--primary);
-      color: #fff;
-      border: none;
-      width: 100%;
-      padding: 12px;
-      border-radius: 6px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.2s;
-    }}
-    .submit-btn:hover {{ background-color: var(--primary-hover); }}
-    .submit-btn:disabled {{ opacity: 0.6; cursor: not-allowed; }}
-    .success-screen {{ display: none; }}
-    .success-icon {{ font-size: 48px; color: var(--success); margin-bottom: 12px; }}
-  </style>
-</head>
-<body>
+# State Transition API: ACCEPT Escalation
+@app.post("/api/escalations/{escalation_id}/accept")
+async def accept_escalation(escalation_id: str):
+    if escalation_id not in escalations_db:
+        raise HTTPException(status_code=404, detail=f"Escalation '{escalation_id}' not found.")
 
-  <div class="upload-card">
-    <div id="form-screen">
-      <span class="badge">Ticket #{ticket_id}</span>
-      <h1>Upload Photo Evidence</h1>
-      <p>Attach a photo of the municipal issue to update your complaint ticket.</p>
-
-      <form id="upload-form">
-        <div class="file-drop" onclick="document.getElementById('photo-input').click()">
-          <div class="file-btn">📷 Choose or Capture Photo</div>
-          <div id="file-name" style="font-size: 12px; color: var(--text-muted);">No file selected</div>
-          <img id="preview" class="preview" alt="Preview" />
-        </div>
-        <input type="file" id="photo-input" name="photo" accept="image/*" capture="environment" required>
-
-        <button type="submit" id="submit-btn" class="submit-btn" disabled>Upload Photo Evidence</button>
-      </form>
-    </div>
-
-    <div id="success-screen" class="success-screen">
-      <div class="success-icon">✅</div>
-      <h1>Photo Uploaded Successfully!</h1>
-      <p>Your photo evidence has been attached to Freshdesk Ticket #{ticket_id}.</p>
-    </div>
-  </div>
-
-  <script>
-    const photoInput = document.getElementById('photo-input');
-    const fileNameDiv = document.getElementById('file-name');
-    const previewImg = document.getElementById('preview');
-    const submitBtn = document.getElementById('submit-btn');
-    const form = document.getElementById('upload-form');
-    const formScreen = document.getElementById('form-screen');
-    const successScreen = document.getElementById('success-screen');
-
-    photoInput.addEventListener('change', (e) => {{
-      const file = e.target.files[0];
-      if (file) {{
-        fileNameDiv.textContent = file.name;
-        submitBtn.disabled = false;
-
-        const reader = new FileReader();
-        reader.onload = (event) => {{
-          previewImg.src = event.target.result;
-          previewImg.style.display = 'block';
-        }};
-        reader.readAsDataURL(file);
-      }}
-    }});
-
-    form.addEventListener('submit', async (e) => {{
-      e.preventDefault();
-      const file = photoInput.files[0];
-      if (!file) return;
-
-      submitBtn.disabled = true;
-      submitBtn.textContent = 'Uploading...';
-
-      const formData = new FormData();
-      formData.append('photo', file);
-
-      try {{
-        const res = await fetch('/upload/{ticket_id}', {{
-          method: 'POST',
-          body: formData
-        }});
-
-        if (res.ok) {{
-          formScreen.style.display = 'none';
-          successScreen.style.display = 'block';
-        }} else {{
-          const err = await res.json();
-          alert('Upload failed: ' + (err.message || 'Unknown error'));
-          submitBtn.disabled = false;
-          submitBtn.textContent = 'Upload Photo Evidence';
-        }}
-      }} catch (error) {{
-        alert('Network error while uploading photo.');
-        submitBtn.disabled = false;
-        submitBtn.textContent = 'Upload Photo Evidence';
-      }}
-    }});
-  </script>
-</body>
-</html>"""
-
-
-@app.post("/upload/{ticket_id}")
-async def process_photo_upload(ticket_id: str, photo: UploadFile = File(...)):
-    raw_domain = os.environ.get("FRESHDESK_DOMAIN", "").strip()
-    freshdesk_key = os.environ.get("FRESHDESK_API_KEY", "").strip()
-
-    if not raw_domain or not freshdesk_key:
-        raise HTTPException(status_code=500, detail="Freshdesk credentials not configured on server.")
-
-    freshdesk_domain = raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
-    if not freshdesk_domain.endswith(".freshdesk.com"):
-        freshdesk_domain = f"{freshdesk_domain}.freshdesk.com"
-
-    notes_url = f"https://{freshdesk_domain}/api/v2/tickets/{ticket_id}/notes"
-
-    contents = await photo.read()
-    filename = photo.filename or "photo_evidence.jpg"
-    content_type = photo.content_type or "image/jpeg"
-
-    files = [
-        ("attachments[]", (filename, contents, content_type))
-    ]
-    data = {
-        "body": f"Photo evidence uploaded by caller for Ticket #{ticket_id} via Setu SMS upload link."
-    }
-
-    try:
-        res = requests.post(
-            notes_url,
-            data=data,
-            files=files,
-            auth=(freshdesk_key, "X"),
-            timeout=15
+    entry = escalations_db[escalation_id]
+    if entry["status"] != "WAITING":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid state transition: Cannot accept escalation in status '{entry['status']}'."
         )
 
-        if res.status_code == 201:
-            logger.info(f"Successfully attached photo evidence to Freshdesk Ticket #{ticket_id}")
-            return {
-                "success": True,
-                "ticket_id": ticket_id,
-                "message": f"Photo evidence successfully attached to Freshdesk Ticket #{ticket_id}."
-            }
-        else:
-            logger.error(f"Freshdesk note attachment error status {res.status_code}: {res.text}")
-            raise HTTPException(status_code=400, detail=f"Freshdesk returned status code {res.status_code}")
+    entry["status"] = "ACCEPTED"
+    entry["accepted_at"] = time.time()
+    logger.info(f"Escalation {escalation_id} ACCEPTED")
+    return entry
 
-    except Exception as e:
-        logger.exception(f"Failed to upload attachment to Freshdesk Ticket #{ticket_id}")
-        raise HTTPException(status_code=500, detail=f"Failed to attach photo to Freshdesk: {str(e)}")
+
+# State Transition API: RESOLVE Escalation
+@app.post("/api/escalations/{escalation_id}/resolve")
+async def resolve_escalation(escalation_id: str):
+    if escalation_id not in escalations_db:
+        raise HTTPException(status_code=404, detail=f"Escalation '{escalation_id}' not found.")
+
+    entry = escalations_db[escalation_id]
+    if entry["status"] not in ["WAITING", "ACCEPTED"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid state transition: Cannot resolve escalation in status '{entry['status']}'."
+        )
+
+    entry["status"] = "RESOLVED"
+    entry["resolved_at"] = time.time()
+    logger.info(f"Escalation {escalation_id} RESOLVED")
+    return entry
 
 
 # Tool 1 Endpoint: create_ticket
@@ -789,7 +606,7 @@ async def transfer_to_human_endpoint(request: Request):
     return execute_transfer_to_human(transfer_req)
 
 
-# Guardrail-Protected Response Check (Backend Safety Net)
+# Guardrail-Protected Response Check
 @app.post("/v1/guardrails/check")
 async def check_guardrails_endpoint(request: Request):
     body = await request.json()
@@ -799,73 +616,6 @@ async def check_guardrails_endpoint(request: Request):
         "intercepted": intercepted,
         "reply": safe_reply,
         "category": category
-    }
-
-
-# Conversational Chat Completions Endpoint
-@app.get("/v1/chat/completions")
-async def chat_get():
-    return {"message": "Setu Supporting Backend is active. Waiting for POST requests."}
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    body = await request.json()
-    messages: List[Dict[str, Any]] = body.get("messages", [])
-    conversation_id = body.get("conversation_id", body.get("channel_name", "default_demo"))
-    stream = body.get("stream", True)
-
-    state = get_or_create_conversation(conversation_id)
-
-    user_messages = [m for m in messages if m.get("role") == "user"]
-    if user_messages:
-        latest_text = user_messages[-1].get("content", "")
-        # Check guardrails first
-        intercepted, safe_reply, category = check_and_apply_guardrails(latest_text)
-        if intercepted:
-            reply_text = safe_reply
-        else:
-            extract_fields_from_text(latest_text, state)
-            reply_text = generate_next_response(state)
-    else:
-        reply_text = generate_next_response(state)
-
-    completion_id = f"chatcmpl-{uuid.uuid4()}"
-    created_time = int(time.time())
-
-    if stream:
-        async def sse_generator():
-            chunk1 = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": "setu-voice-ai",
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply_text}, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(chunk1)}\n\n"
-            chunk2 = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": "setu-voice-ai",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            }
-            yield f"data: {json.dumps(chunk2)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(sse_generator(), media_type="text/event-stream")
-
-    return {
-        "id": completion_id,
-        "object": "chat.completion",
-        "created": created_time,
-        "model": "setu-voice-ai",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": reply_text},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
     }
 
 

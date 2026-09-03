@@ -95,6 +95,33 @@
       margin-bottom: 10px;
     }
 
+    .status-badge {
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .status-WAITING {
+      background-color: rgba(245, 158, 11, 0.2);
+      color: var(--accent-amber);
+      border: 1px solid rgba(245, 158, 11, 0.4);
+    }
+
+    .status-ACCEPTED {
+      background-color: rgba(59, 130, 246, 0.2);
+      color: var(--accent-blue);
+      border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+
+    .status-RESOLVED {
+      background-color: rgba(16, 185, 129, 0.2);
+      color: var(--accent-green);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+
     .reason-badge {
       background-color: rgba(239, 68, 68, 0.15);
       color: var(--accent-red);
@@ -190,79 +217,178 @@
     .unresolved-box .section-body {
       color: #fde68a;
     }
+
+    .card-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+    }
+
+    .btn-action {
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .btn-accept {
+      background-color: var(--accent-blue);
+      color: white;
+    }
+
+    .btn-accept:hover {
+      background-color: #2563eb;
+    }
+
+    .btn-resolve {
+      background-color: var(--accent-green);
+      color: white;
+    }
+
+    .btn-resolve:hover {
+      background-color: #059669;
+    }
+
+    .btn-action:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
   </style>
 </head>
 <body>
 
   <div class="header">
     <h1>🏛️ Setu Municipal Helpline — Human Escalation Console</h1>
-    <div class="badge-channel" id="status-badge">
+    <div class="badge-channel">
       <span class="dot"></span>
-      <span id="status-text">Connected: channel 'human-escalations'</span>
+      <span>Connected: channel 'setu-human-escalations'</span>
     </div>
   </div>
 
   <div class="container" id="cards-container">
     <div class="empty-state" id="empty-state">
-      <p>No human escalations yet. Waiting for live calls from channel <code>human-escalations</code>...</p>
+      <p>No human escalations yet. Waiting for live calls from channel <code>setu-human-escalations</code>...</p>
     </div>
   </div>
 
   <script>
     const cardsContainer = document.getElementById("cards-container");
     const emptyState = document.getElementById("empty-state");
-    const seenIds = new Set();
+    const cardMap = new Map();
 
-    function renderEscalationCard(data) {
-      if (!data || !data.reason) return;
-      const cardId = data.id || `esc-${Date.now()}-${Math.random()}`;
-      if (seenIds.has(cardId)) return;
-      seenIds.add(cardId);
+    function renderOrUpdateCard(data) {
+      if (!data || !data.escalation_id) return;
+      const escId = data.escalation_id;
 
       if (emptyState) emptyState.style.display = "none";
 
       const confirmed = data.confirmed_fields || {};
       const timestamp = data.timestamp || new Date().toLocaleTimeString();
+      const status = data.status || "WAITING";
 
+      if (cardMap.has(escId)) {
+        // Update existing card status badge and buttons
+        const cardElem = cardMap.get(escId);
+        const badge = cardElem.querySelector(".status-badge");
+        if (badge) {
+          badge.className = `status-badge status-${status}`;
+          badge.textContent = status;
+        }
+
+        const acceptBtn = cardElem.querySelector(".btn-accept");
+        const resolveBtn = cardElem.querySelector(".btn-resolve");
+
+        if (acceptBtn) acceptBtn.disabled = (status !== "WAITING");
+        if (resolveBtn) resolveBtn.disabled = (status === "RESOLVED");
+
+        return;
+      }
+
+      // Create new card
       const card = document.createElement("div");
       card.className = "card";
+      card.id = `card-${escId}`;
       card.innerHTML = `
         <div class="card-top">
-          <span class="reason-badge">⚠️ ${escapeHtml(data.reason)}</span>
-          <span class="timestamp">${escapeHtml(timestamp)}</span>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <span class="reason-badge">⚠️ ${escapeHtml(data.reason)}</span>
+            <span class="status-badge status-${status}">${status}</span>
+          </div>
+          <span class="timestamp">${escapeHtml(timestamp)} | ID: ${escapeHtml(escId)}</span>
         </div>
 
-        <div class="issue-title">📋 ${escapeHtml(data.issue_one_line || "Issue Escalated")}</div>
+        <div class="issue-title">📋 ${escapeHtml(data.issue_one_line || data.summary || "Issue Escalated")}</div>
 
         <div class="grid-fields">
           <div class="field-item">
             <span class="field-label">Phone</span>
-            <span class="field-val ${!confirmed.phone ? 'missing' : ''}">${escapeHtml(confirmed.phone || 'Unconfirmed')}</span>
+            <span class="field-val ${!confirmed.phone && !data.phone ? 'missing' : ''}">${escapeHtml(confirmed.phone || data.phone || 'Unconfirmed')}</span>
           </div>
           <div class="field-item">
             <span class="field-label">Location</span>
-            <span class="field-val ${!confirmed.location ? 'missing' : ''}">${escapeHtml(confirmed.location || 'Unconfirmed')}</span>
+            <span class="field-val ${!confirmed.location && !data.location ? 'missing' : ''}">${escapeHtml(confirmed.location || data.location || 'Unconfirmed')}</span>
           </div>
           <div class="field-item">
             <span class="field-label">Issue Type</span>
-            <span class="field-val ${!confirmed.issue_type ? 'missing' : ''}">${escapeHtml(confirmed.issue_type || 'Unconfirmed')}</span>
+            <span class="field-val ${!confirmed.issue_type && !data.issue_type ? 'missing' : ''}">${escapeHtml(confirmed.issue_type || data.issue_type || 'Unconfirmed')}</span>
           </div>
           <div class="field-item">
             <span class="field-label">Description</span>
-            <span class="field-val ${!confirmed.description ? 'missing' : ''}">${escapeHtml(confirmed.description || 'Unconfirmed')}</span>
+            <span class="field-val ${!confirmed.description && !data.description ? 'missing' : ''}">${escapeHtml(confirmed.description || data.description || 'Unconfirmed')}</span>
           </div>
         </div>
 
         <div class="section-title">Key Conversation Points</div>
-        <p class="section-body">${escapeHtml(data.key_points || 'None')}</p>
+        <p class="section-body">${escapeHtml(data.key_points || data.summary || 'None')}</p>
 
         <div class="unresolved-box">
           <div class="section-title">Why Human Help Is Needed</div>
           <p class="section-body">${escapeHtml(data.unresolved || 'None')}</p>
         </div>
+
+        <div class="card-actions">
+          <button class="btn-action btn-accept" onclick="acceptEscalation('${escId}')" ${status !== 'WAITING' ? 'disabled' : ''}>[ Accept ]</button>
+          <button class="btn-action btn-resolve" onclick="resolveEscalation('${escId}')" ${status === 'RESOLVED' ? 'disabled' : ''}>[ Resolve ]</button>
+        </div>
       `;
 
+      cardMap.set(escId, card);
       cardsContainer.prepend(card);
+    }
+
+    async function acceptEscalation(escId) {
+      try {
+        const res = await fetch(`/api/escalations/${escId}/accept`, { method: "POST" });
+        if (res.ok) {
+          const updated = await res.json();
+          renderOrUpdateCard(updated);
+        } else {
+          const err = await res.json();
+          alert("Accept failed: " + (err.detail || "Invalid state transition"));
+        }
+      } catch (e) {
+        alert("Error accepting escalation.");
+      }
+    }
+
+    async function resolveEscalation(escId) {
+      try {
+        const res = await fetch(`/api/escalations/${escId}/resolve`, { method: "POST" });
+        if (res.ok) {
+          const updated = await res.json();
+          renderOrUpdateCard(updated);
+        } else {
+          const err = await res.json();
+          alert("Resolve failed: " + (err.detail || "Invalid state transition"));
+        }
+      } catch (e) {
+        alert("Error resolving escalation.");
+      }
     }
 
     function escapeHtml(str) {
@@ -274,14 +400,13 @@
         .replace(/"/g, '&quot;');
     }
 
-    // Auto-poll fallback to ensure instant rendering across all environments
     async function pollEscalations() {
       try {
         const res = await fetch("/api/escalations");
         if (res.ok) {
           const items = await res.json();
           if (Array.isArray(items)) {
-            items.forEach(renderEscalationCard);
+            items.forEach(renderOrUpdateCard);
           }
         }
       } catch (err) {
@@ -289,7 +414,7 @@
       }
     }
 
-    setInterval(pollEscalations, 2000);
+    setInterval(pollEscalations, 1500);
     pollEscalations();
   </script>
 </body>
