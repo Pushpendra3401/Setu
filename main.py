@@ -72,9 +72,9 @@ def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
 # ------------------------------------------------------------------------------
 MEDICAL_PATTERNS = [
     r"\b(take\s*(a\s*)?(pill|tablet|medicine|dose|\d+)|dosage|dose|mg|ml|pills?|tablets?|capsules?)\b",
-    r"\b(ibuprofen|paracetamol|aspirin|antibiotic|prescription|ointment)\b",
+    r"\b(ibuprofen|paracetamol|aspirin|antibiotic|prescription|ointment|medical)\b",
     r"\b(diagnos(e|is)|symptoms? of|treat(ment)?|cure|remedy)\b",
-    r"\b(first aid|apply pressure|bandage|cpr)\b"
+    r"\b(first aid|apply pressure|bandage|cpr|fever)\b"
 ]
 
 LEGAL_PATTERNS = [
@@ -198,15 +198,31 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
     lowered = text.lower()
     location_match = None
 
+    # 1. Extract & Accumulate Phone Digits
     is_valid_phone, clean_phone = validate_indian_phone(text)
     if is_valid_phone:
         state["phone"] = clean_phone
         state["phone_confidence"] = "high"
-    elif len(clean_phone) > 0 and state["phone_confidence"] != "high":
-        state["phone_confidence"] = "low"
+    else:
+        # Accumulate partial digits
+        accum = state.get("phone_partial", "") + clean_phone
+        state["phone_partial"] = accum
+        is_accum_valid, clean_accum = validate_indian_phone(accum)
+        if is_accum_valid:
+            state["phone"] = clean_accum
+            state["phone_confidence"] = "high"
+
+    # Handle correction during confirmation or late turns
+    if "no" in lowered or "wrong" in lowered or "change" in lowered or "instead" in lowered:
+        state["confirmed"] = False
+        loc_corr = re.search(r"\b(jodhpur|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+|ward\s*\d+)\b", lowered)
+        if loc_corr:
+            state["location"] = loc_corr.group(0).title()
+            state["location_confidence"] = "high"
+            return state
 
     if state["location_confidence"] != "high":
-        location_match = re.search(r"\b(ward\s*\d+|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+)\b", lowered)
+        location_match = re.search(r"\b(ward\s*\d+|jaipur|jodhpur|delhi|mumbai|bangalore|pune|sector\s*\d+)\b", lowered)
         if location_match:
             state["location"] = location_match.group(0).title()
             state["location_confidence"] = "high"
@@ -229,7 +245,7 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
         state["issue_type_confidence"] = "high"
 
     if state["phone_confidence"] == "high" and state["location_confidence"] == "high" and state["issue_type_confidence"] == "high":
-        if lowered not in ["yes", "no", "hello", "ok", "correct", "confirm", "haan", "ha", "yes, correct"]:
+        if not lowered.startswith("no") and lowered not in ["yes", "no", "hello", "ok", "correct", "confirm", "haan", "ha", "yes, correct"]:
             if not is_valid_phone and not location_match:
                 state["description"] = text
                 state["description_confidence"] = "high"

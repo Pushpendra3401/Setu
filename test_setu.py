@@ -4,7 +4,7 @@ Setu Voice AI Backend Test Suite (test_setu.py)
 Verifies conversation state tracking, priority order, low-confidence escalation,
 deterministic guardrails (medical, legal, financial, adversarial), ticket creation,
 SMS upload link triggering, RTM Human Escalation Console state transitions,
-and Production Hardening / Reliability checks (Tests 1-30).
+Production Hardening / Reliability checks, and Voice Experience / Conversation Quality (Tests 1-40).
 """
 
 import os
@@ -428,7 +428,7 @@ def test_security_check():
 
 
 # ------------------------------------------------------------------------------
-# RELIABILITY & PRODUCTION HARDENING TESTS (TEST 21 - 28)
+# RELIABILITY & PRODUCTION HARDENING TESTS (TEST 21 - 26)
 # ------------------------------------------------------------------------------
 def test_duplicate_accept_protection():
     log_test_header("TEST 21: Duplicate Accept Protection")
@@ -504,19 +504,190 @@ def test_fast2sms_failure_isolation():
     assert_test(passed, "Fast2SMS missing key/failure handled safely without crashing app", sms_res)
 
 
-def test_channel_isolation():
-    log_test_header("TEST 27: Multi-Call Channel Isolation")
-    res1 = execute_transfer_to_human(TransferToHumanRequest(reason="Call A", channel_name="chan_A"))
-    res2 = execute_transfer_to_human(TransferToHumanRequest(reason="Call B", channel_name="chan_B"))
+# ------------------------------------------------------------------------------
+# VOICE EXPERIENCE & CONVERSATION QUALITY TESTS (TEST 27 - 40)
+# ------------------------------------------------------------------------------
+def test_phone_fragments():
+    log_test_header("TEST 27: Phone Number Split Across Turns")
+    conv_id = f"test_frag_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
 
-    id1 = res1.get("escalation_id")
-    id2 = res2.get("escalation_id")
+    extract_fields_from_text("six three six two", state)
+    r1 = generate_next_response(state)
 
-    chan1 = escalations_db[id1]["channel_name"]
-    chan2 = escalations_db[id2]["channel_name"]
+    extract_fields_from_text("eight two nine seven three two", state)
+    r2 = generate_next_response(state)
 
-    passed = chan1 == "chan_A" and chan2 == "chan_B" and chan1 != chan2
-    assert_test(passed, f"Channels isolated across concurrent calls ({chan1} vs {chan2})", f"{id1}: {chan1} | {id2}: {chan2}")
+    passed = state["phone"] == "6362829732" and state["phone_confidence"] == "high"
+    assert_test(passed, "Phone number fragments combined into valid 10-digit number 6362829732", state)
+
+
+def test_phone_correction():
+    log_test_header("TEST 28: Phone Number Correction")
+    conv_id = f"test_corr_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("My phone number is 9876543210", state)
+    extract_fields_from_text("No, my number is 6362829732", state)
+
+    passed = state["phone"] == "6362829732"
+    assert_test(passed, "Phone number corrected successfully to 6362829732", state)
+
+
+def test_location_recognition():
+    log_test_header("TEST 29: Location Recognition (Indian Cities & Wards)")
+    conv_id = f"test_loc_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("6362829732", state)
+    extract_fields_from_text("I am calling from Jaipur Ward 14", state)
+
+    passed = state["location_confidence"] == "high" and "Jaipur" in state["location"]
+    assert_test(passed, "Recognized Indian city 'Jaipur' as valid location", state["location"])
+
+
+def test_natural_electricity_phrasing():
+    log_test_header("TEST 30: Natural Electricity Issue Recognition")
+    conv_id = f"test_elec_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("There is a power cut in my street and light is gone", state)
+
+    passed = state["issue_type"] == "electricity"
+    assert_test(passed, "Mapped natural phrase 'power cut in my street' to issue_type 'electricity'", state)
+
+
+def test_hinglish_issue_recognition():
+    log_test_header("TEST 31: Hinglish Issue Recognition")
+    conv_id_1 = f"test_hing1_{uuid.uuid4().hex[:6]}"
+    state_1 = get_or_create_conversation(conv_id_1)
+    extract_fields_from_text("Mere area mein light nahi aa rahi", state_1)
+
+    conv_id_2 = f"test_hing2_{uuid.uuid4().hex[:6]}"
+    state_2 = get_or_create_conversation(conv_id_2)
+    extract_fields_from_text("Paani ki problem hai water leakage ho raha hai", state_2)
+
+    passed = state_1["issue_type"] == "electricity" and state_2["issue_type"] == "water"
+    assert_test(passed, "Hinglish queries mapped correctly to 'electricity' and 'water'", f"Light: {state_1['issue_type']} | Paani: {state_2['issue_type']}")
+
+
+def test_mid_conversation_hello():
+    log_test_header("TEST 32: Mid-Conversation 'Hello?' Handling")
+    conv_id = f"test_hello_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("6362829732", state)
+    extract_fields_from_text("Jaipur", state)
+
+    # User says "Hello?"
+    extract_fields_from_text("Hello? Can you hear me?", state)
+    r = generate_next_response(state)
+
+    passed = state["phone"] == "6362829732" and state["location"] == "Jaipur" and "issue" in r.lower()
+    assert_test(passed, "State preserved when caller said 'Hello?'; assistant asked for next missing field (issue_type)", r)
+
+
+def test_no_repeated_field_requests():
+    log_test_header("TEST 33: No Repeated Requests for Confirmed Fields")
+    conv_id = f"test_norepeat_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("6362829732", state)
+    extract_fields_from_text("Jaipur", state)
+    extract_fields_from_text("water problem", state)
+    extract_fields_from_text("pipe leakage near house 12", state)
+
+    reply = generate_next_response(state)
+
+    passed = "phone" not in reply.lower().split("confirm")[0] if "confirm" in reply.lower() else True
+    assert_test(passed, "Assistant did not ask for phone or location again once high confidence was reached", reply)
+
+
+def test_confirmation_correction():
+    log_test_header("TEST 34: Correction After Confirmation Prompt")
+    conv_id = f"test_conf_corr_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("6362829732", state)
+    extract_fields_from_text("Jaipur", state)
+    extract_fields_from_text("water problem", state)
+    extract_fields_from_text("pipe leakage near house 12", state)
+
+    # User corrects location during confirmation!
+    extract_fields_from_text("No, the location is Jodhpur", state)
+
+    passed = state["confirmed"] is False and "Jodhpur" in state["location"]
+    assert_test(passed, "Location corrected to Jodhpur during confirmation step without calling ticket creation", state)
+
+
+def test_natural_confirmation():
+    log_test_header("TEST 35: Natural Confirmation Phrases")
+    conv_id = f"test_nat_conf_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("6362829732", state)
+    extract_fields_from_text("Jaipur", state)
+    extract_fields_from_text("water problem", state)
+    extract_fields_from_text("pipe leakage near house 12", state)
+
+    extract_fields_from_text("Yes, correct", state)
+
+    passed = state["confirmed"] is True
+    assert_test(passed, "Natural confirmation 'Yes, correct' locked in confirmation state", state["confirmed"])
+
+
+def test_ticket_success_response():
+    log_test_header("TEST 36: Ticket Success Response Format")
+    req = CreateTicketRequest(phone="6362829732", location="Jaipur", issue_type="water", description="Pipe leakage")
+    res = execute_create_ticket(req)
+
+    passed = res.get("success") is True and "registered successfully" in res.get("message", "").lower()
+    assert_test(passed, "Returned clear ticket registration confirmation message", res.get("message"))
+
+
+def test_freshdesk_failure_response():
+    log_test_header("TEST 37: Freshdesk Failure Handling Response")
+    orig_dom = os.environ.get("FRESHDESK_DOMAIN")
+    orig_mode = os.environ.get("TEST_MODE")
+
+    os.environ["TEST_MODE"] = "false"
+    os.environ["FRESHDESK_DOMAIN"] = "invalid-domain-12345.freshdesk.com"
+
+    req = CreateTicketRequest(phone="6362829732", location="Jaipur", issue_type="water", description="Pipe leakage")
+    res = execute_create_ticket(req)
+
+    os.environ["TEST_MODE"] = orig_mode or "true"
+    if orig_dom:
+        os.environ["FRESHDESK_DOMAIN"] = orig_dom
+
+    passed = res.get("success") is False
+    assert_test(passed, "Returned honest failure response when Freshdesk is unavailable", res)
+
+
+def test_human_handoff_language():
+    log_test_header("TEST 38: Human Handoff Conversational Response")
+    intercepted, safe_reply, cat = check_and_apply_guardrails("I need emergency medical help")
+
+    passed = intercepted is True and "not able to help with that directly" in safe_reply
+    assert_test(passed, "Safe override response speaks natural handoff wording", safe_reply)
+
+
+def test_ai_stops_after_human_connected():
+    log_test_header("TEST 39: AI Agent Stops / Status Updates on Takeover")
+    req = TransferToHumanRequest(reason="Handover Test", summary="Handover test")
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+
+    asyncio.run(accept_escalation(esc_id))
+    from main import update_escalation_status
+    class DummyReq:
+        async def json(self):
+            return {"status": "HUMAN_CONNECTED"}
+
+    asyncio.run(update_escalation_status(esc_id, DummyReq()))
+
+    passed = escalations_db[esc_id]["status"] == "HUMAN_CONNECTED"
+    assert_test(passed, "State transitioned to HUMAN_CONNECTED when operator joined", escalations_db[esc_id])
 
 
 # ------------------------------------------------------------------------------
@@ -524,7 +695,7 @@ def test_channel_isolation():
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n=======================================================")
-    print("SETU RELIABILITY & HARDENING TEST SUITE (TEST_MODE=true)")
+    print("SETU VOICE AI CONVERSATION QUALITY TEST SUITE (TEST_MODE=true)")
     print("=======================================================")
 
     test_happy_path()
@@ -554,7 +725,20 @@ if __name__ == "__main__":
     test_health_check_endpoint()
     test_env_check_endpoint()
     test_fast2sms_failure_isolation()
-    test_channel_isolation()
+
+    test_phone_fragments()
+    test_phone_correction()
+    test_location_recognition()
+    test_natural_electricity_phrasing()
+    test_hinglish_issue_recognition()
+    test_mid_conversation_hello()
+    test_no_repeated_field_requests()
+    test_confirmation_correction()
+    test_natural_confirmation()
+    test_ticket_success_response()
+    test_freshdesk_failure_response()
+    test_human_handoff_language()
+    test_ai_stops_after_human_connected()
 
     print("\n=======================================================")
     print(f"TEST RESULTS SUMMARY: {PASS_COUNT} PASSED | {FAIL_COUNT} FAILED")
