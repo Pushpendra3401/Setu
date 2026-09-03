@@ -3,7 +3,8 @@ Setu Voice AI Backend Test Suite (test_setu.py)
 
 Verifies conversation state tracking, priority order, low-confidence escalation,
 deterministic guardrails (medical, legal, financial, adversarial), ticket creation,
-SMS upload link triggering, and RTM Human Escalation Console state transitions.
+SMS upload link triggering, RTM Human Escalation Console state transitions,
+and Production Hardening / Reliability checks (Tests 1-30).
 """
 
 import os
@@ -27,6 +28,11 @@ from main import (
     execute_transfer_to_human,
     accept_escalation,
     resolve_escalation,
+    update_escalation_status,
+    get_operator_token,
+    env_check,
+    health,
+    mask_phone,
     CreateTicketRequest,
     TransferToHumanRequest,
     conversations_db,
@@ -359,7 +365,6 @@ def test_persistence_after_refresh():
     asyncio.run(accept_escalation(esc_id))
     asyncio.run(resolve_escalation(esc_id))
 
-    # Re-fetch from database
     persisted = escalations_db.get(esc_id)
     passed = persisted and persisted["status"] == "RESOLVED"
     assert_test(passed, f"Escalation {esc_id} status remained RESOLVED after reload", persisted)
@@ -423,11 +428,103 @@ def test_security_check():
 
 
 # ------------------------------------------------------------------------------
+# RELIABILITY & PRODUCTION HARDENING TESTS (TEST 21 - 28)
+# ------------------------------------------------------------------------------
+def test_duplicate_accept_protection():
+    log_test_header("TEST 21: Duplicate Accept Protection")
+    req = TransferToHumanRequest(reason="Dup Accept Test", summary="Dup Accept test")
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+
+    res1 = asyncio.run(accept_escalation(esc_id))
+    res2 = asyncio.run(accept_escalation(esc_id))
+
+    passed = res2.get("message") == "Escalation already accepted"
+    assert_test(passed, "Duplicate accept request handled safely without state corruption", res2)
+
+
+def test_resolved_token_prevention():
+    log_test_header("TEST 22: Resolved Escalation Token Prevention")
+    req = TransferToHumanRequest(reason="Resolved Token Test", summary="Resolved Token test")
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+
+    asyncio.run(accept_escalation(esc_id))
+    asyncio.run(resolve_escalation(esc_id))
+
+    blocked = False
+    try:
+        asyncio.run(get_operator_token(channel_name="test_chan", escalation_id=esc_id))
+    except Exception as e:
+        blocked = True
+
+    assert_test(blocked, "Operator token request rejected for resolved escalation", esc_id)
+
+
+def test_phone_masking():
+    log_test_header("TEST 23: Phone Masking in Logs")
+    masked = mask_phone("6362829732")
+    passed = masked == "******9732" and "6362" not in masked
+    assert_test(passed, f"Phone number 6362829732 masked safely as {masked}", masked)
+
+
+def test_health_check_endpoint():
+    log_test_header("TEST 24: Health Check Endpoint")
+    res = asyncio.run(health())
+    passed = res.get("status") == "ok" and res.get("version") == "3.4.0"
+    assert_test(passed, "GET /health endpoint responded with status 'ok'", res)
+
+
+def test_env_check_endpoint():
+    log_test_header("TEST 25: Safe Environment Checklist Endpoint")
+    res = asyncio.run(env_check())
+    has_status = "FRESHDESK_DOMAIN" in res and "FRESHDESK_API_KEY" in res
+    secrets = ["_QhINFlkDVVAmS71gfzN", "8101d78a52424c81bf832b3e9aadf796"]
+    exposed = [s for s in secrets if s in str(res)]
+
+    passed = has_status and len(exposed) == 0
+    assert_test(passed, "GET /api/env_check returns safe checklist without exposing secrets", res)
+
+
+def test_fast2sms_failure_isolation():
+    log_test_header("TEST 26: Fast2SMS Failure Isolation")
+    orig_mode = os.environ.get("TEST_MODE")
+    orig_key = os.environ.get("FAST2SMS_API_KEY")
+
+    os.environ["TEST_MODE"] = "false"
+    os.environ["FAST2SMS_API_KEY"] = ""
+
+    sms_res = send_sms_upload_link("6362829732", 9999)
+
+    os.environ["TEST_MODE"] = orig_mode or "true"
+    if orig_key:
+        os.environ["FAST2SMS_API_KEY"] = orig_key
+
+    passed = sms_res.get("sent") is False and "upload_link" in sms_res
+    assert_test(passed, "Fast2SMS missing key/failure handled safely without crashing app", sms_res)
+
+
+def test_channel_isolation():
+    log_test_header("TEST 27: Multi-Call Channel Isolation")
+    res1 = execute_transfer_to_human(TransferToHumanRequest(reason="Call A", channel_name="chan_A"))
+    res2 = execute_transfer_to_human(TransferToHumanRequest(reason="Call B", channel_name="chan_B"))
+
+    id1 = res1.get("escalation_id")
+    id2 = res2.get("escalation_id")
+
+    chan1 = escalations_db[id1]["channel_name"]
+    chan2 = escalations_db[id2]["channel_name"]
+
+    passed = chan1 == "chan_A" and chan2 == "chan_B" and chan1 != chan2
+    assert_test(passed, f"Channels isolated across concurrent calls ({chan1} vs {chan2})", f"{id1}: {chan1} | {id2}: {chan2}")
+
+
+# ------------------------------------------------------------------------------
 # MAIN TEST RUNNER
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n=======================================================")
-    print("SETU RTM HUMAN ESCALATION TEST SUITE (TEST_MODE=true)")
+    print("SETU RELIABILITY & HARDENING TEST SUITE (TEST_MODE=true)")
     print("=======================================================")
 
     test_happy_path()
@@ -450,6 +547,14 @@ if __name__ == "__main__":
     test_invalid_state_transition()
     test_multiple_escalations()
     test_security_check()
+
+    test_duplicate_accept_protection()
+    test_resolved_token_prevention()
+    test_phone_masking()
+    test_health_check_endpoint()
+    test_env_check_endpoint()
+    test_fast2sms_failure_isolation()
+    test_channel_isolation()
 
     print("\n=======================================================")
     print(f"TEST RESULTS SUMMARY: {PASS_COUNT} PASSED | {FAIL_COUNT} FAILED")
