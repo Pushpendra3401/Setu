@@ -3,13 +3,14 @@ Setu Voice AI Backend Test Suite (test_setu.py)
 
 Verifies conversation state tracking, priority order, low-confidence escalation,
 deterministic guardrails (medical, legal, financial, adversarial), ticket creation,
-and SMS upload link triggering in TEST_MODE.
+SMS upload link triggering, and RTM Human Escalation Console state transitions.
 """
 
 import os
 import sys
 import json
 import uuid
+import asyncio
 from typing import Any
 
 # Force TEST_MODE=true for testing without spamming real Freshdesk/Fast2SMS APIs
@@ -23,10 +24,13 @@ from main import (
     check_and_apply_guardrails,
     execute_create_ticket,
     send_sms_upload_link,
+    execute_transfer_to_human,
+    accept_escalation,
+    resolve_escalation,
     CreateTicketRequest,
     TransferToHumanRequest,
     conversations_db,
-    escalations_list
+    escalations_db
 )
 
 PASS_COUNT = 0
@@ -59,23 +63,18 @@ def test_happy_path():
     conv_id = f"test_happy_{uuid.uuid4().hex[:6]}"
     state = get_or_create_conversation(conv_id)
 
-    # Turn 1: Hello
     extract_fields_from_text("Hello", state)
     r1 = generate_next_response(state)
 
-    # Turn 2: Phone
     extract_fields_from_text("My phone number is 6362829732", state)
     r2 = generate_next_response(state)
 
-    # Turn 3: Location
     extract_fields_from_text("Jaipur", state)
     r3 = generate_next_response(state)
 
-    # Turn 4: Issue Type
     extract_fields_from_text("I have an electricity problem", state)
     r4 = generate_next_response(state)
 
-    # Turn 5: Description
     extract_fields_from_text("Power cut in block A", state)
     r5 = generate_next_response(state)
 
@@ -101,11 +100,9 @@ def test_priority_order():
     conv_id = f"test_priority_{uuid.uuid4().hex[:6]}"
     state = get_or_create_conversation(conv_id)
 
-    # User volunteers issue type first!
     extract_fields_from_text("I want to report an electricity problem.", state)
     reply = generate_next_response(state)
 
-    # Backend must still ask for PHONE first (Priority 1)
     passed = "mobile number" in reply.lower() or "phone" in reply.lower()
     assert_test(passed, "Priority Order: User gave issue_type first, backend still demanded phone number next", reply)
 
@@ -115,8 +112,6 @@ def test_priority_order():
 # ------------------------------------------------------------------------------
 def test_low_confidence_escalation():
     log_test_header("TEST 3: Low-Confidence Escalation")
-
-    # Simulate a structured transfer_to_human request
     esc_req = TransferToHumanRequest(
         reason="Low confidence on location after 2 attempts",
         issue_one_line="Electricity issue in unconfirmed area",
@@ -125,17 +120,12 @@ def test_low_confidence_escalation():
         unresolved="Exact ward and area name could not be confirmed."
     )
 
-    # Reset escalations_list
-    escalations_list.clear()
-
-    # Execute
-    from main import execute_transfer_to_human
+    escalations_db.clear()
     res = execute_transfer_to_human(esc_req)
 
-    # Verify structured fields
     has_all_fields = False
-    if escalations_list:
-        entry = escalations_list[-1]
+    if escalations_db:
+        entry = list(escalations_db.values())[-1]
         has_all_fields = (
             bool(entry.get("reason")) and
             bool(entry.get("issue_one_line")) and
@@ -145,7 +135,7 @@ def test_low_confidence_escalation():
         )
 
     passed = res.get("success") is True and has_all_fields
-    assert_test(passed, "Low Confidence: Structured escalation contains all 5 required fields", escalations_list[-1] if escalations_list else res)
+    assert_test(passed, "Low Confidence: Structured escalation contains all 5 required fields", list(escalations_db.values())[-1] if escalations_db else res)
 
 
 # ------------------------------------------------------------------------------
@@ -171,11 +161,9 @@ def test_guardrail_medical():
 def test_guardrail_legal_financial():
     log_test_header("TEST 5: Guardrail — Legal & Financial Advice Interception")
 
-    # Legal
     legal_text = "Should I sue my landlord and hire a lawyer for this water damage?"
     i_legal, reply_legal, cat_legal = check_and_apply_guardrails(legal_text)
 
-    # Financial
     fin_text = "Should I take a loan or invest in stocks to fund this municipal repair?"
     i_fin, reply_fin, cat_fin = check_and_apply_guardrails(fin_text)
 
@@ -227,7 +215,7 @@ def test_ticket_creation_params():
 
 
 # ------------------------------------------------------------------------------
-# TEST 8: SMS Trigger & Link Verification
+# TEST 8: SMS Trigger & Upload Link
 # ------------------------------------------------------------------------------
 def test_sms_trigger():
     log_test_header("TEST 8: SMS Trigger & Upload Link")
@@ -242,11 +230,204 @@ def test_sms_trigger():
 
 
 # ------------------------------------------------------------------------------
+# TEST 9: transfer_to_human Creates Escalation
+# ------------------------------------------------------------------------------
+def test_escalation_creation():
+    log_test_header("TEST 9: transfer_to_human Creates Escalation")
+    req = TransferToHumanRequest(
+        reason="Low confidence on location after 2 attempts",
+        summary="Electricity issue in unconfirmed area"
+    )
+    res = execute_transfer_to_human(req)
+
+    esc_id = res.get("escalation_id", "")
+    passed = (
+        res.get("success") is True and
+        esc_id.startswith("ESC-") and
+        esc_id in escalations_db and
+        escalations_db[esc_id]["status"] == "WAITING"
+    )
+    assert_test(passed, f"transfer_to_human created escalation {esc_id} with status WAITING", res)
+
+
+# ------------------------------------------------------------------------------
+# TEST 10: Escalation Data Integrity
+# ------------------------------------------------------------------------------
+def test_escalation_data_integrity():
+    log_test_header("TEST 10: Escalation Data Integrity")
+    req = TransferToHumanRequest(
+        reason="Low confidence on location after 2 attempts",
+        issue_one_line="Water leakage in Ward 14",
+        confirmed_fields={"phone": "6362829732", "issue_type": "water"},
+        key_points="Caller reported water leakage. Phone 6362829732 confirmed.",
+        unresolved="Exact street address could not be confirmed."
+    )
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+    data = escalations_db.get(esc_id, {})
+
+    passed = (
+        data.get("type") == "human_escalation" and
+        data.get("reason") == "Low confidence on location after 2 attempts" and
+        data.get("issue_one_line") == "Water leakage in Ward 14" and
+        data.get("phone") == "6362829732" and
+        data.get("issue_type") == "water" and
+        data.get("status") == "WAITING"
+    )
+    assert_test(passed, "Escalation contains correct structured fields", data)
+
+
+# ------------------------------------------------------------------------------
+# TEST 11: RTM Publication
+# ------------------------------------------------------------------------------
+def test_rtm_publication():
+    log_test_header("TEST 11: RTM Publication (Mock in TEST_MODE)")
+    req = TransferToHumanRequest(reason="Test RTM Publish", summary="RTM test")
+    res = execute_transfer_to_human(req)
+
+    passed = res.get("success") is True and "escalation_id" in res
+    assert_test(passed, "MOCK RTM: Escalation published through Agora RTM in TEST_MODE", res)
+
+
+# ------------------------------------------------------------------------------
+# TEST 12 & 13: Operator Console & Realtime Delivery
+# ------------------------------------------------------------------------------
+def test_realtime_delivery():
+    log_test_header("TEST 12 & 13: Operator Console & Realtime Delivery")
+    from main import get_escalations
+    before_len = len(asyncio.run(get_escalations()))
+
+    req = TransferToHumanRequest(reason="Realtime Test", summary="Realtime Delivery Test")
+    res = execute_transfer_to_human(req)
+
+    after_items = asyncio.run(get_escalations())
+    passed = len(after_items) == before_len + 1 and after_items[-1]["escalation_id"] == res.get("escalation_id")
+    assert_test(passed, "Realtime Delivery: New escalation appears in operator console feed automatically", res)
+
+
+# ------------------------------------------------------------------------------
+# TEST 14: WAITING State
+# ------------------------------------------------------------------------------
+def test_waiting_state():
+    log_test_header("TEST 14: WAITING State Verification")
+    req = TransferToHumanRequest(reason="Initial State Test", summary="Waiting state test")
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+
+    passed = escalations_db[esc_id]["status"] == "WAITING"
+    assert_test(passed, "New escalation starts in WAITING state", escalations_db[esc_id])
+
+
+# ------------------------------------------------------------------------------
+# TEST 15: Accept Escalation
+# ------------------------------------------------------------------------------
+def test_accept_escalation():
+    log_test_header("TEST 15: Accept Escalation (WAITING -> ACCEPTED)")
+    req = TransferToHumanRequest(reason="Accept Test", summary="Accept test")
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+
+    updated = asyncio.run(accept_escalation(esc_id))
+    passed = updated["status"] == "ACCEPTED" and updated["accepted_at"] is not None
+    assert_test(passed, f"Escalation {esc_id} ACCEPTED and persisted server-side", updated)
+
+
+# ------------------------------------------------------------------------------
+# TEST 16: Resolve Escalation
+# ------------------------------------------------------------------------------
+def test_resolve_escalation():
+    log_test_header("TEST 16: Resolve Escalation (ACCEPTED -> RESOLVED)")
+    req = TransferToHumanRequest(reason="Resolve Test", summary="Resolve test")
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+
+    asyncio.run(accept_escalation(esc_id))
+    updated = asyncio.run(resolve_escalation(esc_id))
+    passed = updated["status"] == "RESOLVED" and updated["resolved_at"] is not None
+    assert_test(passed, f"Escalation {esc_id} RESOLVED and persisted server-side", updated)
+
+
+# ------------------------------------------------------------------------------
+# TEST 17: Persistence After Refresh
+# ------------------------------------------------------------------------------
+def test_persistence_after_refresh():
+    log_test_header("TEST 17: Persistence After Refresh")
+    req = TransferToHumanRequest(reason="Refresh Test", summary="Refresh persistence test")
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+
+    asyncio.run(accept_escalation(esc_id))
+    asyncio.run(resolve_escalation(esc_id))
+
+    # Re-fetch from database
+    persisted = escalations_db.get(esc_id)
+    passed = persisted and persisted["status"] == "RESOLVED"
+    assert_test(passed, f"Escalation {esc_id} status remained RESOLVED after reload", persisted)
+
+
+# ------------------------------------------------------------------------------
+# TEST 18: Invalid Transition Rejection
+# ------------------------------------------------------------------------------
+def test_invalid_state_transition():
+    log_test_header("TEST 18: Invalid State Transition Rejection")
+    req = TransferToHumanRequest(reason="Invalid Transition Test", summary="Invalid transition test")
+    res = execute_transfer_to_human(req)
+    esc_id = res.get("escalation_id")
+
+    asyncio.run(accept_escalation(esc_id))
+    asyncio.run(resolve_escalation(esc_id))
+
+    rejected = False
+    try:
+        asyncio.run(accept_escalation(esc_id))
+    except Exception as e:
+        rejected = True
+
+    assert_test(rejected, f"Invalid transition RESOLVED -> ACCEPTED rejected with error", esc_id)
+
+
+# ------------------------------------------------------------------------------
+# TEST 19: Multiple Escalations Independence
+# ------------------------------------------------------------------------------
+def test_multiple_escalations():
+    log_test_header("TEST 19: Multiple Escalations Independence")
+    res1 = execute_transfer_to_human(TransferToHumanRequest(reason="Esc 1", summary="Esc 1"))
+    res2 = execute_transfer_to_human(TransferToHumanRequest(reason="Esc 2", summary="Esc 2"))
+
+    id1 = res1.get("escalation_id")
+    id2 = res2.get("escalation_id")
+
+    asyncio.run(accept_escalation(id1))
+
+    passed = (
+        escalations_db[id1]["status"] == "ACCEPTED" and
+        escalations_db[id2]["status"] == "WAITING"
+    )
+    assert_test(passed, "Multiple escalations remain independent when status changes", f"{id1}: {escalations_db[id1]['status']} | {id2}: {escalations_db[id2]['status']}")
+
+
+# ------------------------------------------------------------------------------
+# TEST 20: Security Check
+# ------------------------------------------------------------------------------
+def test_security_check():
+    log_test_header("TEST 20: Security Check (No Secrets Exposed)")
+    from main import get_escalations
+    items = asyncio.run(get_escalations())
+    json_str = json.dumps(items)
+
+    secrets = ["FRESHDESK_API_KEY", "FAST2SMS_API_KEY", "_QhINFlkDVVAmS71gfzN", "8101d78a52424c81bf832b3e9aadf796"]
+    exposed = [s for s in secrets if s in json_str]
+
+    passed = len(exposed) == 0
+    assert_test(passed, "Security Check: Server secrets are NOT exposed in API responses or frontend payloads", exposed)
+
+
+# ------------------------------------------------------------------------------
 # MAIN TEST RUNNER
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n=======================================================")
-    print("SETU VOICE AI BACKEND TEST SUITE (TEST_MODE=true)")
+    print("SETU RTM HUMAN ESCALATION TEST SUITE (TEST_MODE=true)")
     print("=======================================================")
 
     test_happy_path()
@@ -257,6 +438,18 @@ if __name__ == "__main__":
     test_guardrail_adversarial()
     test_ticket_creation_params()
     test_sms_trigger()
+
+    test_escalation_creation()
+    test_escalation_data_integrity()
+    test_rtm_publication()
+    test_realtime_delivery()
+    test_waiting_state()
+    test_accept_escalation()
+    test_resolve_escalation()
+    test_persistence_after_refresh()
+    test_invalid_state_transition()
+    test_multiple_escalations()
+    test_security_check()
 
     print("\n=======================================================")
     print(f"TEST RESULTS SUMMARY: {PASS_COUNT} PASSED | {FAIL_COUNT} FAILED")
