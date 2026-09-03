@@ -273,6 +273,9 @@ def generate_next_response(state: Dict[str, Any]) -> str:
 # Fast2SMS Integration Function
 # ------------------------------------------------------------------------------
 def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
+    """
+    Sends an SMS to the caller's mobile number via Fast2SMS containing the photo upload link.
+    """
     api_key = os.environ.get("FAST2SMS_API_KEY", "").strip()
     raw_domain = os.environ.get("SETU_RENDER_DOMAIN", "setu-9mx9.onrender.com").strip()
     render_domain = raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
@@ -299,24 +302,23 @@ def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
     url = "https://www.fast2sms.com/dev/bulkV2"
     sms_message = f"Setu Municipal Helpline: Upload photo evidence for Ticket #{ticket_id} here: {upload_link}"
 
-    payload = {
+    # Fast2SMS query parameters (supports both GET and POST)
+    params = {
+        "authorization": api_key,
         "route": "q",
         "message": sms_message,
         "language": "english",
         "flash": 0,
         "numbers": phone
     }
-    headers = {
-        "authorization": api_key,
-        "Content-Type": "application/json"
-    }
 
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        # Try Fast2SMS GET request (most reliable for Fast2SMS Quick SMS route)
+        res = requests.get(url, params=params, timeout=10)
         res_data = res.json() if "json" in res.headers.get("content-type", "") else {"text": res.text}
         logger.info(f"Fast2SMS API Response for {phone}: {res_data}")
 
-        is_success = res.status_code == 200 and res_data.get("return") is True
+        is_success = res.status_code == 200 and isinstance(res_data, dict) and res_data.get("return") is True
         return {
             "sent": is_success,
             "upload_link": upload_link,
