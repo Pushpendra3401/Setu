@@ -10,9 +10,9 @@ import time
 import logging
 
 app = FastAPI(
-    title="Setu Municipal Helpline Backend Tools",
-    description="Backend tool execution server providing create_ticket, Fast2SMS evidence link, and Freshdesk integration",
-    version="2.4.0"
+    title="Setu Municipal Helpline Backend Tools & Safety Guardrails",
+    description="Backend tool execution server with deterministic guardrails, create_ticket, Fast2SMS evidence link, and Freshdesk integration",
+    version="3.1.0"
 )
 
 logger = logging.getLogger("uvicorn.error")
@@ -26,6 +26,72 @@ WORD_TO_DIGIT = {
 
 # In-memory log of structured escalations for console.html
 escalations_list: List[Dict[str, Any]] = []
+
+# ------------------------------------------------------------------------------
+# Deterministic Backend Guardrails Definitions (Medical, Legal, Financial, Emergency)
+# ------------------------------------------------------------------------------
+MEDICAL_PATTERNS = [
+    r"\b(take|dosage|dose|mg|ml|pills?|tablets?|capsules?)\b",
+    r"\b(ibuprofen|paracetamol|aspirin|antibiotic|prescription|ointment)\b",
+    r"\b(diagnos(e|is)|symptoms? of|treat(ment)?|cure|remedy)\b",
+    r"\b(first aid|apply pressure|bandage|cpr)\b"
+]
+
+LEGAL_PATTERNS = [
+    r"\b(you should sue|sue them|file a lawsuit|hire a lawyer|attorney)\b",
+    r"\b(legal (rights|action|counsel|advice)|court case|liable for damages)\b",
+    r"\b(prosecute|subpoena|breach of contract)\b"
+]
+
+FINANCIAL_PATTERNS = [
+    r"\b(invest (in|your)|buy (stock|shares|crypto|bitcoin)|guaranteed returns?)\b",
+    r"\b(financial advice|portfolio|stock market|trading tip)\b",
+    r"\b(transfer money|wire funds|tax loophole)\b"
+]
+
+EMERGENCY_PATTERNS = [
+    r"\b(call (911|108|112|ambulance|police|fire brigade))\b",
+    r"\b(evacuate immediately|emergency room|icu)\b"
+]
+
+ALL_GUARDRAIL_PATTERNS = {
+    "medical": MEDICAL_PATTERNS,
+    "legal": LEGAL_PATTERNS,
+    "financial": FINANCIAL_PATTERNS,
+    "emergency": EMERGENCY_PATTERNS
+}
+
+SAFE_GUARDRAIL_RESPONSE = "I'm not able to help with that directly, but I'll connect you with someone who can."
+
+
+def check_and_apply_guardrails(reply_text: str) -> tuple[bool, str, Optional[str]]:
+    """
+    Deterministically scans reply_text against medical, legal, financial, and emergency regex patterns.
+    If detected, returns (True, SAFE_GUARDRAIL_RESPONSE, matched_category) and triggers transfer_to_human.
+    """
+    if not reply_text:
+        return False, reply_text, None
+
+    lowered = reply_text.lower()
+
+    for category, patterns in ALL_GUARDRAIL_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, lowered):
+                logger.warning(f"DETERMINISTIC GUARDRAIL INTERCEPTED [{category.upper()}]: '{reply_text}'")
+
+                # Automatically trigger transfer_to_human escalation
+                esc_req = TransferToHumanRequest(
+                    reason=f"Guardrail Intercepted: {category.title()} Advice Detected",
+                    issue_one_line=f"Restricted Advice Intercepted ({category.title()} Query)",
+                    confirmed_fields={},
+                    key_points=f"Backend guardrail intercepted response containing restricted advice: '{reply_text[:120]}...'",
+                    unresolved=f"Caller requested {category} assistance. Backend safety net overrode output and requested human escalation."
+                )
+                execute_transfer_to_human(esc_req)
+
+                return True, SAFE_GUARDRAIL_RESPONSE, category
+
+    return False, reply_text, None
 
 
 # ------------------------------------------------------------------------------
@@ -85,9 +151,6 @@ def validate_issue_type(issue_type: str) -> tuple[bool, str]:
 # Fast2SMS Integration Function
 # ------------------------------------------------------------------------------
 def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
-    """
-    Sends an SMS to the caller's mobile number via Fast2SMS containing the photo upload link.
-    """
     api_key = os.environ.get("FAST2SMS_API_KEY", "").strip()
     raw_domain = os.environ.get("SETU_RENDER_DOMAIN", "setu-9mx9.onrender.com").strip()
     render_domain = raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
@@ -276,7 +339,7 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
 async def root():
     return {
         "status": "Setu Supporting Tools Backend is active!",
-        "architecture": "Agora Conversational AI Backend Tool Execution Server",
+        "architecture": "Agora Conversational AI Backend Tool Execution & Guardrail Server",
         "tools": ["create_ticket", "transfer_to_human"],
         "console_url": "/console"
     }
@@ -355,15 +418,8 @@ async def upload_page(ticket_id: str):
       font-weight: 600;
       margin-bottom: 12px;
     }}
-    h1 {{
-      font-size: 20px;
-      margin: 0 0 8px 0;
-    }}
-    p {{
-      font-size: 14px;
-      color: var(--text-muted);
-      margin: 0 0 20px 0;
-    }}
+    h1 {{ font-size: 20px; margin: 0 0 8px 0; }}
+    p {{ font-size: 14px; color: var(--text-muted); margin: 0 0 20px 0; }}
     .file-drop {{
       border: 2px dashed var(--border);
       border-radius: 8px;
@@ -372,9 +428,7 @@ async def upload_page(ticket_id: str):
       background: #0f172a;
       cursor: pointer;
     }}
-    input[type="file"] {{
-      display: none;
-    }}
+    input[type="file"] {{ display: none; }}
     .file-btn {{
       background: var(--border);
       color: var(--text);
@@ -404,21 +458,10 @@ async def upload_page(ticket_id: str):
       cursor: pointer;
       transition: background 0.2s;
     }}
-    .submit-btn:hover {{
-      background-color: var(--primary-hover);
-    }}
-    .submit-btn:disabled {{
-      opacity: 0.6;
-      cursor: not-allowed;
-    }}
-    .success-screen {{
-      display: none;
-    }}
-    .success-icon {{
-      font-size: 48px;
-      color: var(--success);
-      margin-bottom: 12px;
-    }}
+    .submit-btn:hover {{ background-color: var(--primary-hover); }}
+    .submit-btn:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+    .success-screen {{ display: none; }}
+    .success-icon {{ font-size: 48px; color: var(--success); margin-bottom: 12px; }}
   </style>
 </head>
 <body>
@@ -509,12 +552,9 @@ async def upload_page(ticket_id: str):
 </html>"""
 
 
-# Photo Upload Endpoint POST (Attaches Image File to Freshdesk Ticket as Note)
+# Photo Upload Endpoint POST
 @app.post("/upload/{ticket_id}")
 async def process_photo_upload(ticket_id: str, photo: UploadFile = File(...)):
-    """
-    Receives uploaded image file and attaches it to the Freshdesk ticket as a note.
-    """
     raw_domain = os.environ.get("FRESHDESK_DOMAIN", "").strip()
     freshdesk_key = os.environ.get("FRESHDESK_API_KEY", "").strip()
 
@@ -605,6 +645,23 @@ async def transfer_to_human_endpoint(request: Request):
         return {"success": False, "error": "invalid_request_format", "message": f"Missing parameters: {str(e)}"}
 
     return execute_transfer_to_human(transfer_req)
+
+
+# Guardrail-Protected Response Check (Backend Safety Net)
+@app.post("/v1/guardrails/check")
+async def check_guardrails_endpoint(request: Request):
+    """
+    Scans reply text for restricted medical, legal, financial, or emergency advice.
+    If intercepted, returns safe override response and triggers human escalation.
+    """
+    body = await request.json()
+    text = body.get("text", "")
+    intercepted, safe_reply, category = check_and_apply_guardrails(text)
+    return {
+        "intercepted": intercepted,
+        "reply": safe_reply,
+        "category": category
+    }
 
 
 if __name__ == "__main__":
