@@ -418,7 +418,8 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
                 "ticket_id": ticket_id,
                 "message": f"Complaint registered successfully. Ticket ID is {ticket_id}.",
                 "upload_link": sms_res.get("upload_link"),
-                "sms_sent": sms_res.get("sent", False)
+                "sms_sent": sms_res.get("sent", False),
+                "sms_debug": sms_res.get("fast2sms_response")
             }
         else:
             return {
