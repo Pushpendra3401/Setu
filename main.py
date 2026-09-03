@@ -7,6 +7,7 @@ import re
 import requests
 import json
 import time
+import uuid
 import logging
 
 app = FastAPI(
@@ -26,6 +27,30 @@ WORD_TO_DIGIT = {
 
 # In-memory log of structured escalations for console.html
 escalations_list: List[Dict[str, Any]] = []
+
+# In-memory conversation state database
+conversations_db: Dict[str, Dict[str, Any]] = {}
+
+
+def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
+    """Retrieves or initializes conversation state dictionary."""
+    if conversation_id not in conversations_db:
+        conversations_db[conversation_id] = {
+            "conversation_id": conversation_id,
+            "phone": None,
+            "phone_confidence": "low",
+            "location": None,
+            "location_confidence": "low",
+            "issue_type": None,
+            "issue_type_confidence": "low",
+            "description": None,
+            "description_confidence": "low",
+            "confirmed": False,
+            "ticket_id": None,
+            "updated_at": time.time()
+        }
+    return conversations_db[conversation_id]
+
 
 # ------------------------------------------------------------------------------
 # Deterministic Backend Guardrails Definitions (Medical, Legal, Financial, Emergency)
@@ -113,7 +138,7 @@ class TransferToHumanRequest(BaseModel):
 
 
 # ------------------------------------------------------------------------------
-# Validation Helpers
+# Validation & Extraction Helpers
 # ------------------------------------------------------------------------------
 def validate_indian_phone(text: str) -> tuple[bool, str]:
     if not text or not isinstance(text, str):
@@ -147,6 +172,101 @@ def validate_issue_type(issue_type: str) -> tuple[bool, str]:
     return False, normalized
 
 
+def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    text = user_text.strip()
+    lowered = text.lower()
+
+    # 1. Extract Phone Number
+    is_valid_phone, clean_phone = validate_indian_phone(text)
+    if is_valid_phone:
+        state["phone"] = clean_phone
+        state["phone_confidence"] = "high"
+    elif len(clean_phone) > 0 and state["phone_confidence"] != "high":
+        state["phone_confidence"] = "low"
+
+    # 2. Extract Location
+    location_match = re.search(r"\b(ward\s*\d+|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+|block\s*[a-z0-9]+)\b", lowered)
+    if location_match:
+        state["location"] = location_match.group(0).title()
+        state["location_confidence"] = "high"
+    elif state["phone_confidence"] == "high" and state["location_confidence"] != "high" and not is_valid_phone:
+        if len(text) >= 3 and not re.search(r"^\d+$", "".join(re.findall(r"\d", text))) and not any(k in lowered for k in ["water", "electricity", "garbage", "certificate", "yes", "no", "hello"]):
+            state["location"] = text.title()
+            state["location_confidence"] = "high"
+
+    # 3. Extract Issue Type
+    if "water" in lowered or "pipe" in lowered or "leak" in lowered or "drain" in lowered:
+        state["issue_type"] = "water"
+        state["issue_type_confidence"] = "high"
+    elif "garbage" in lowered or "trash" in lowered or "waste" in lowered or "clean" in lowered:
+        state["issue_type"] = "garbage"
+        state["issue_type_confidence"] = "high"
+    elif "electricity" in lowered or "power" in lowered or "light" in lowered or "current" in lowered or "generator" in lowered:
+        state["issue_type"] = "electricity"
+        state["issue_type_confidence"] = "high"
+    elif "certificate" in lowered or "birth" in lowered or "death" in lowered or "license" in lowered:
+        state["issue_type"] = "certificate"
+        state["issue_type_confidence"] = "high"
+
+    # 4. Extract Description
+    if state["phone_confidence"] == "high" and state["location_confidence"] == "high" and state["issue_type_confidence"] == "high":
+        if lowered not in ["yes", "no", "hello", "ok", "correct", "confirm", "haan", "ha", "yes, correct"]:
+            if not is_valid_phone and not location_match:
+                state["description"] = text
+                state["description_confidence"] = "high"
+
+    # 5. Handle Confirmation
+    if lowered in ["yes", "correct", "true", "confirm", "haan", "haa", "ha", "yes correct", "yes, correct"]:
+        if (state["phone_confidence"] == "high" and
+            state["location_confidence"] == "high" and
+            state["issue_type_confidence"] == "high" and
+            state["description_confidence"] == "high"):
+            state["confirmed"] = True
+
+    state["updated_at"] = time.time()
+    return state
+
+
+def generate_next_response(state: Dict[str, Any]) -> str:
+    # Priority 1: Phone
+    if state["phone_confidence"] != "high":
+        return "Namaste! Welcome to Setu municipal helpline. Could you please provide your 10-digit mobile number?"
+
+    # Priority 2: Location
+    if state["location_confidence"] != "high":
+        return f"Thank you. I have noted your phone number as {state['phone']}. Which ward, area, or location are you calling from?"
+
+    # Priority 3: Issue Type
+    if state["issue_type_confidence"] != "high":
+        return f"Got it. Location is {state['location']}. What type of issue are you facing? (water, garbage, electricity, certificate, or other)"
+
+    # Priority 4: Description
+    if state["description_confidence"] != "high":
+        return f"Understood, issue type is {state['issue_type']}. Could you please give a brief description of the problem?"
+
+    # Priority 5: Confirmation
+    if not state["confirmed"]:
+        return (f"Let me confirm your details: Phone {state['phone']}, Location {state['location']}, "
+                f"Issue Type {state['issue_type']}, Description '{state['description']}'. Is this information correct?")
+
+    # Confirmed -> Execute Ticket Creation
+    if state["confirmed"] and not state["ticket_id"]:
+        ticket_req = CreateTicketRequest(
+            phone=state["phone"],
+            location=state["location"],
+            issue_type=state["issue_type"],
+            description=state["description"]
+        )
+        res = execute_create_ticket(ticket_req)
+        if res.get("success"):
+            state["ticket_id"] = res.get("ticket_id")
+            return f"Thank you! Your complaint has been registered in Freshdesk with Ticket ID #{res.get('ticket_id')}."
+        else:
+            return f"Your details are confirmed, but Freshdesk ticket creation returned: {res.get('message')}"
+
+    return f"Your complaint is already registered under Ticket ID #{state['ticket_id']}. Thank you for calling Setu!"
+
+
 # ------------------------------------------------------------------------------
 # Fast2SMS Integration Function
 # ------------------------------------------------------------------------------
@@ -156,6 +276,14 @@ def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
     render_domain = raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
 
     upload_link = f"https://{render_domain}/upload/{ticket_id}"
+
+    if os.environ.get("TEST_MODE", "").lower() in ["true", "1"]:
+        logger.info(f"[TEST_MODE] Simulating SMS to {phone}. Upload link: {upload_link}")
+        return {
+            "sent": True,
+            "upload_link": upload_link,
+            "fast2sms_response": {"return": True, "message": "Simulated SMS sent successfully"}
+        }
 
     if not api_key:
         logger.warning(f"FAST2SMS_API_KEY not set. Skipping SMS. Photo upload link: {upload_link}")
@@ -229,6 +357,18 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
     if not clean_description:
         return {"success": False, "error": "invalid_description", "message": "Description parameter cannot be empty."}
 
+    if os.environ.get("TEST_MODE", "").lower() in ["true", "1"]:
+        mock_ticket_id = 9999
+        logger.info(f"[TEST_MODE] Simulating Freshdesk ticket creation #{mock_ticket_id} for phone {clean_phone}")
+        sms_res = send_sms_upload_link(clean_phone, mock_ticket_id)
+        return {
+            "success": True,
+            "ticket_id": mock_ticket_id,
+            "message": f"Complaint registered successfully. Ticket ID is {mock_ticket_id}.",
+            "upload_link": sms_res.get("upload_link"),
+            "sms_sent": sms_res.get("sent", True)
+        }
+
     raw_domain = os.environ.get("FRESHDESK_DOMAIN", "").strip()
     freshdesk_key = os.environ.get("FRESHDESK_API_KEY", "").strip()
 
@@ -267,7 +407,6 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
             ticket_data = response.json()
             ticket_id = ticket_data.get("id")
 
-            # Trigger SMS upload link to caller via Fast2SMS
             sms_res = send_sms_upload_link(clean_phone, ticket_id)
 
             return {
@@ -365,7 +504,6 @@ async def get_escalations():
     return escalations_list
 
 
-# Mobile Photo Upload Page GET
 @app.get("/upload/{ticket_id}", response_class=HTMLResponse)
 async def upload_page(ticket_id: str):
     return f"""<!DOCTYPE html>
@@ -552,7 +690,6 @@ async def upload_page(ticket_id: str):
 </html>"""
 
 
-# Photo Upload Endpoint POST
 @app.post("/upload/{ticket_id}")
 async def process_photo_upload(ticket_id: str, photo: UploadFile = File(...)):
     raw_domain = os.environ.get("FRESHDESK_DOMAIN", "").strip()
@@ -650,10 +787,6 @@ async def transfer_to_human_endpoint(request: Request):
 # Guardrail-Protected Response Check (Backend Safety Net)
 @app.post("/v1/guardrails/check")
 async def check_guardrails_endpoint(request: Request):
-    """
-    Scans reply text for restricted medical, legal, financial, or emergency advice.
-    If intercepted, returns safe override response and triggers human escalation.
-    """
     body = await request.json()
     text = body.get("text", "")
     intercepted, safe_reply, category = check_and_apply_guardrails(text)
@@ -661,6 +794,73 @@ async def check_guardrails_endpoint(request: Request):
         "intercepted": intercepted,
         "reply": safe_reply,
         "category": category
+    }
+
+
+# Conversational Chat Completions Endpoint
+@app.get("/v1/chat/completions")
+async def chat_get():
+    return {"message": "Setu Supporting Backend is active. Waiting for POST requests."}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    body = await request.json()
+    messages: List[Dict[str, Any]] = body.get("messages", [])
+    conversation_id = body.get("conversation_id", body.get("channel_name", "default_demo"))
+    stream = body.get("stream", True)
+
+    state = get_or_create_conversation(conversation_id)
+
+    user_messages = [m for m in messages if m.get("role") == "user"]
+    if user_messages:
+        latest_text = user_messages[-1].get("content", "")
+        # Check guardrails first
+        intercepted, safe_reply, category = check_and_apply_guardrails(latest_text)
+        if intercepted:
+            reply_text = safe_reply
+        else:
+            extract_fields_from_text(latest_text, state)
+            reply_text = generate_next_response(state)
+    else:
+        reply_text = generate_next_response(state)
+
+    completion_id = f"chatcmpl-{uuid.uuid4()}"
+    created_time = int(time.time())
+
+    if stream:
+        async def sse_generator():
+            chunk1 = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": "setu-voice-ai",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply_text}, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(chunk1)}\n\n"
+            chunk2 = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": "setu-voice-ai",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(chunk2)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created_time,
+        "model": "setu-voice-ai",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": reply_text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
     }
 
 
