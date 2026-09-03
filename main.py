@@ -56,7 +56,7 @@ def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
 # Deterministic Backend Guardrails Definitions (Medical, Legal, Financial, Emergency)
 # ------------------------------------------------------------------------------
 MEDICAL_PATTERNS = [
-    r"\b(take|dosage|dose|mg|ml|pills?|tablets?|capsules?)\b",
+    r"\b(take\s*(a\s*)?(pill|tablet|medicine|dose|\d+)|dosage|dose|mg|ml|pills?|tablets?|capsules?)\b",
     r"\b(ibuprofen|paracetamol|aspirin|antibiotic|prescription|ointment)\b",
     r"\b(diagnos(e|is)|symptoms? of|treat(ment)?|cure|remedy)\b",
     r"\b(first aid|apply pressure|bandage|cpr)\b"
@@ -175,6 +175,7 @@ def validate_issue_type(issue_type: str) -> tuple[bool, str]:
 def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
     text = user_text.strip()
     lowered = text.lower()
+    location_match = None
 
     # 1. Extract Phone Number
     is_valid_phone, clean_phone = validate_indian_phone(text)
@@ -184,15 +185,16 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
     elif len(clean_phone) > 0 and state["phone_confidence"] != "high":
         state["phone_confidence"] = "low"
 
-    # 2. Extract Location
-    location_match = re.search(r"\b(ward\s*\d+|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+|block\s*[a-z0-9]+)\b", lowered)
-    if location_match:
-        state["location"] = location_match.group(0).title()
-        state["location_confidence"] = "high"
-    elif state["phone_confidence"] == "high" and state["location_confidence"] != "high" and not is_valid_phone:
-        if len(text) >= 3 and not re.search(r"^\d+$", "".join(re.findall(r"\d", text))) and not any(k in lowered for k in ["water", "electricity", "garbage", "certificate", "yes", "no", "hello"]):
-            state["location"] = text.title()
+    # 2. Extract Location (only if location is not already locked in with high confidence)
+    if state["location_confidence"] != "high":
+        location_match = re.search(r"\b(ward\s*\d+|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+)\b", lowered)
+        if location_match:
+            state["location"] = location_match.group(0).title()
             state["location_confidence"] = "high"
+        elif state["phone_confidence"] == "high" and not is_valid_phone:
+            if len(text) >= 3 and not re.search(r"^\d+$", "".join(re.findall(r"\d", text))) and not any(k in lowered for k in ["water", "electricity", "garbage", "certificate", "yes", "no", "hello"]):
+                state["location"] = text.title()
+                state["location_confidence"] = "high"
 
     # 3. Extract Issue Type
     if "water" in lowered or "pipe" in lowered or "leak" in lowered or "drain" in lowered:
