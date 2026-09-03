@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Setu Municipal Helpline — Human Escalation Console</title>
-  <!-- Agora RTM v2 SDK -->
-  <script src="https://cdn.jsdelivr.net/npm/agora-rtm-sdk@2.2.0/index.js"></script>
+  <title>Setu Municipal Helpline — Human Voice Handoff Console</title>
+  <!-- Agora RTC Web SDK v4 -->
+  <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.22.0.js"></script>
   <style>
     :root {
       --bg-color: #0f172a;
@@ -17,6 +17,7 @@
       --accent-amber: #f59e0b;
       --accent-blue: #3b82f6;
       --accent-green: #10b981;
+      --accent-purple: #8b5cf6;
     }
 
     body {
@@ -114,6 +115,12 @@
       background-color: rgba(59, 130, 246, 0.2);
       color: var(--accent-blue);
       border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+
+    .status-HUMAN_CONNECTED {
+      background-color: rgba(139, 92, 246, 0.25);
+      color: #a78bfa;
+      border: 1px solid rgba(139, 92, 246, 0.5);
     }
 
     .status-RESOLVED {
@@ -224,6 +231,8 @@
       margin-top: 14px;
       padding-top: 12px;
       border-top: 1px solid var(--border-color);
+      align-items: center;
+      flex-wrap: wrap;
     }
 
     .btn-action {
@@ -234,6 +243,9 @@
       border: none;
       cursor: pointer;
       transition: background 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
 
     .btn-accept {
@@ -243,6 +255,20 @@
 
     .btn-accept:hover {
       background-color: #2563eb;
+    }
+
+    .btn-mute {
+      background-color: #475569;
+      color: white;
+    }
+
+    .btn-mute.muted {
+      background-color: var(--accent-red);
+    }
+
+    .btn-leave {
+      background-color: #dc2626;
+      color: white;
     }
 
     .btn-resolve {
@@ -258,21 +284,28 @@
       opacity: 0.4;
       cursor: not-allowed;
     }
+
+    .rtc-status {
+      font-size: 12px;
+      font-weight: 600;
+      color: #a78bfa;
+      margin-left: auto;
+    }
   </style>
 </head>
 <body>
 
   <div class="header">
-    <h1>🏛️ Setu Municipal Helpline — Human Escalation Console</h1>
+    <h1>🏛️ Setu Municipal Helpline — Human Voice Handoff Console</h1>
     <div class="badge-channel">
       <span class="dot"></span>
-      <span>Connected: channel 'setu-human-escalations'</span>
+      <span>Live Voice Takeover Enabled</span>
     </div>
   </div>
 
   <div class="container" id="cards-container">
     <div class="empty-state" id="empty-state">
-      <p>No human escalations yet. Waiting for live calls from channel <code>setu-human-escalations</code>...</p>
+      <p>No human escalations yet. Waiting for live calls...</p>
     </div>
   </div>
 
@@ -280,6 +313,12 @@
     const cardsContainer = document.getElementById("cards-container");
     const emptyState = document.getElementById("empty-state");
     const cardMap = new Map();
+
+    // RTC Voice State
+    let activeRtcClient = null;
+    let activeMicTrack = null;
+    let activeEscId = null;
+    let isMicMuted = false;
 
     function renderOrUpdateCard(data) {
       if (!data || !data.escalation_id) return;
@@ -292,12 +331,11 @@
       const status = data.status || "WAITING";
 
       if (cardMap.has(escId)) {
-        // Update existing card status badge and buttons
         const cardElem = cardMap.get(escId);
         const badge = cardElem.querySelector(".status-badge");
         if (badge) {
           badge.className = `status-badge status-${status}`;
-          badge.textContent = status;
+          badge.textContent = status === "HUMAN_CONNECTED" ? "🟢 HUMAN CONNECTED" : status;
         }
 
         const acceptBtn = cardElem.querySelector(".btn-accept");
@@ -317,7 +355,7 @@
         <div class="card-top">
           <div style="display: flex; gap: 8px; align-items: center;">
             <span class="reason-badge">⚠️ ${escapeHtml(data.reason)}</span>
-            <span class="status-badge status-${status}">${status}</span>
+            <span class="status-badge status-${status}">${status === "HUMAN_CONNECTED" ? "🟢 HUMAN CONNECTED" : status}</span>
           </div>
           <span class="timestamp">${escapeHtml(timestamp)} | ID: ${escapeHtml(escId)}</span>
         </div>
@@ -351,9 +389,10 @@
           <p class="section-body">${escapeHtml(data.unresolved || 'None')}</p>
         </div>
 
-        <div class="card-actions">
-          <button class="btn-action btn-accept" onclick="acceptEscalation('${escId}')" ${status !== 'WAITING' ? 'disabled' : ''}>[ Accept ]</button>
-          <button class="btn-action btn-resolve" onclick="resolveEscalation('${escId}')" ${status === 'RESOLVED' ? 'disabled' : ''}>[ Resolve ]</button>
+        <div class="card-actions" id="actions-${escId}">
+          <button class="btn-action btn-accept" onclick="acceptAndJoinCall('${escId}', '${escapeHtml(data.channel_name || 'default')}')" ${status !== 'WAITING' ? 'disabled' : ''}>🎙️ Accept & Join Call</button>
+          <button class="btn-action btn-resolve" onclick="resolveEscalation('${escId}')" ${status === 'RESOLVED' ? 'disabled' : ''}>✅ Resolve</button>
+          <span class="rtc-status" id="rtc-text-${escId}"></span>
         </div>
       `;
 
@@ -361,23 +400,120 @@
       cardsContainer.prepend(card);
     }
 
-    async function acceptEscalation(escId) {
+    async function acceptAndJoinCall(escId, channelName) {
       try {
+        // 1. Accept escalation on server
         const res = await fetch(`/api/escalations/${escId}/accept`, { method: "POST" });
-        if (res.ok) {
-          const updated = await res.json();
-          renderOrUpdateCard(updated);
-        } else {
+        if (!res.ok) {
           const err = await res.json();
           alert("Accept failed: " + (err.detail || "Invalid state transition"));
+          return;
         }
-      } catch (e) {
-        alert("Error accepting escalation.");
+
+        activeEscId = escId;
+        const rtcStatusText = document.getElementById(`rtc-text-${escId}`);
+        if (rtcStatusText) rtcStatusText.textContent = "Connecting to Voice Call...";
+
+        // 2. Get Operator RTC token
+        const tokenRes = await fetch(`/api/get_operator_token?channel_name=${encodeURIComponent(channelName)}`);
+        const tokenData = await tokenRes.json();
+
+        const appId = tokenData.app_id;
+        const token = tokenData.token;
+        const actualChannel = tokenData.channel_name || channelName;
+        const operatorUid = tokenData.operator_uid;
+
+        // 3. Initialize Agora RTC client and join channel
+        activeRtcClient = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+
+        // Subscribe to remote caller audio
+        activeRtcClient.on("user-published", async (user, mediaType) => {
+          if (mediaType === "audio") {
+            await activeRtcClient.subscribe(user, mediaType);
+            user.audioTrack.play();
+            if (rtcStatusText) rtcStatusText.textContent = "🔊 Caller Audio Connected";
+          }
+        });
+
+        await activeRtcClient.join(appId, actualChannel, token, operatorUid);
+
+        // 4. Create and publish operator microphone track
+        activeMicTrack = await AgoraRTC.createMicrophoneAudioTrack();
+        await activeRtcClient.publish([activeMicTrack]);
+
+        // 5. Update backend status to HUMAN_CONNECTED
+        await fetch(`/api/escalations/${escId}/status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "HUMAN_CONNECTED" })
+        });
+
+        // 6. Update card UI with active audio controls
+        const actionsDiv = document.getElementById(`actions-${escId}`);
+        if (actionsDiv) {
+          actionsDiv.innerHTML = `
+            <button class="btn-action btn-mute" id="mute-btn-${escId}" onclick="toggleMute()">🎙️ Mute Mic</button>
+            <button class="btn-action btn-leave" onclick="leaveCall('${escId}')">🚪 Leave Call</button>
+            <button class="btn-action btn-resolve" onclick="resolveEscalation('${escId}')">✅ Resolve</button>
+            <span class="rtc-status" style="color: #a78bfa;">🟢 HUMAN CONNECTED (Live)</span>
+          `;
+        }
+
+        renderOrUpdateCard({ escalation_id: escId, status: "HUMAN_CONNECTED" });
+
+      } catch (error) {
+        console.error("Failed to join voice call:", error);
+        alert("Failed to connect voice call: " + error.message);
+        const rtcStatusText = document.getElementById(`rtc-text-${escId}`);
+        if (rtcStatusText) rtcStatusText.textContent = "⚠️ Voice Connection Failed";
+      }
+    }
+
+    async function toggleMute() {
+      if (!activeMicTrack || !activeEscId) return;
+      isMicMuted = !isMicMuted;
+      await activeMicTrack.setEnabled(!isMicMuted);
+      const muteBtn = document.getElementById(`mute-btn-${activeEscId}`);
+      if (muteBtn) {
+        muteBtn.textContent = isMicMuted ? "🔇 Unmute Mic" : "🎙️ Mute Mic";
+        muteBtn.classList.toggle("muted", isMicMuted);
+      }
+    }
+
+    async function leaveCall(escId) {
+      if (activeMicTrack) {
+        activeMicTrack.stop();
+        activeMicTrack.close();
+        activeMicTrack = null;
+      }
+      if (activeRtcClient) {
+        await activeRtcClient.leave();
+        activeRtcClient = null;
+      }
+
+      await fetch(`/api/escalations/${escId}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "HUMAN_ENDED" })
+      });
+
+      renderOrUpdateCard({ escalation_id: escId, status: "ACCEPTED" });
+
+      const actionsDiv = document.getElementById(`actions-${escId}`);
+      if (actionsDiv) {
+        actionsDiv.innerHTML = `
+          <button class="btn-action btn-accept" onclick="acceptAndJoinCall('${escId}', '')" disabled>🎙️ Call Ended</button>
+          <button class="btn-action btn-resolve" onclick="resolveEscalation('${escId}')">✅ Resolve</button>
+          <span class="rtc-status" style="color: var(--text-muted);">Operator Left Call</span>
+        `;
       }
     }
 
     async function resolveEscalation(escId) {
       try {
+        if (activeEscId === escId) {
+          await leaveCall(escId);
+        }
         const res = await fetch(`/api/escalations/${escId}/resolve`, { method: "POST" });
         if (res.ok) {
           const updated = await res.json();

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, File, UploadFile
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
@@ -8,12 +8,13 @@ import requests
 import json
 import time
 import uuid
+import random
 import logging
 
 app = FastAPI(
-    title="Setu Municipal Helpline Backend Tools & Safety Guardrails",
-    description="Backend tool execution server with RTM Escalation Console, Freshdesk Integration, and Guardrails",
-    version="3.2.0"
+    title="Setu Municipal Helpline Backend Tools & Human Voice Handoff",
+    description="Backend tool execution server with human voice handoff, Freshdesk integration, and safety guardrails",
+    version="3.3.0"
 )
 
 logger = logging.getLogger("uvicorn.error")
@@ -25,15 +26,12 @@ WORD_TO_DIGIT = {
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
 }
 
-# ------------------------------------------------------------------------------
-# In-Memory Persistence Databases
-# ------------------------------------------------------------------------------
+# In-memory persistence databases
 conversations_db: Dict[str, Dict[str, Any]] = {}
 escalations_db: Dict[str, Dict[str, Any]] = {}
 
 
 def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
-    """Retrieves or initializes conversation state dictionary."""
     if conversation_id not in conversations_db:
         conversations_db[conversation_id] = {
             "conversation_id": conversation_id,
@@ -53,7 +51,7 @@ def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# Deterministic Backend Guardrails Definitions
+# Deterministic Backend Guardrails
 # ------------------------------------------------------------------------------
 MEDICAL_PATTERNS = [
     r"\b(take\s*(a\s*)?(pill|tablet|medicine|dose|\d+)|dosage|dose|mg|ml|pills?|tablets?|capsules?)\b",
@@ -136,6 +134,11 @@ class TransferToHumanRequest(BaseModel):
     location: Optional[str] = None
     issue_type: Optional[str] = None
     description: Optional[str] = None
+    channel_name: Optional[str] = None
+
+
+class StatusUpdateRequest(BaseModel):
+    status: str
 
 
 # ------------------------------------------------------------------------------
@@ -422,7 +425,7 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# Tool 2: transfer_to_human Implementation (Structured RTM Escalation)
+# Tool 2: transfer_to_human Implementation
 # ------------------------------------------------------------------------------
 def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
     clean_reason = data.reason.strip() if data.reason else "Out of scope / low confidence request"
@@ -436,12 +439,14 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
     location_val = data.location or confirmed_fields.get("location")
     issue_type_val = data.issue_type or confirmed_fields.get("issue_type")
     description_val = data.description or confirmed_fields.get("description")
+    channel_name_val = data.channel_name or "default_demo_channel"
 
     escalation_id = f"ESC-{uuid.uuid4().hex[:6].upper()}"
 
     escalation_entry = {
         "type": "human_escalation",
         "escalation_id": escalation_id,
+        "channel_name": channel_name_val,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "reason": clean_reason,
         "summary": clean_summary,
@@ -486,6 +491,7 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
         "success": True,
         "status": "human_escalation_requested",
         "escalation_id": escalation_id,
+        "channel_name": channel_name_val,
         "message": "Human escalation logged and published to Agora RTM successfully."
     }
 
@@ -497,7 +503,7 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
 async def root():
     return {
         "status": "Setu Supporting Tools Backend is active!",
-        "architecture": "Agora Conversational AI Backend Tool Execution & Guardrail Server",
+        "architecture": "Agora Conversational AI Backend Tool Execution & Human Handoff Server",
         "tools": ["create_ticket", "transfer_to_human"],
         "console_url": "/console",
         "total_escalations": len(escalations_db)
@@ -524,6 +530,28 @@ async def get_escalations():
     return list(escalations_db.values())
 
 
+# Generate Operator RTC Token Endpoint
+@app.get("/api/get_operator_token")
+async def get_operator_token(channel_name: str = Query(...), operator_uid: Optional[int] = Query(default=None)):
+    app_id = os.environ.get("AGORA_APP_ID", "abd31bdcd9a14e5bb8004a1ee6eb5e70")
+    app_certificate = os.environ.get("AGORA_APP_CERTIFICATE", "8101d78a52424c81bf832b3e9aadf796")
+    uid = operator_uid or random.randint(800000, 899999)
+
+    try:
+        from agora_agent.agentkit.token import generate_convo_ai_token
+        token = generate_convo_ai_token(app_id, app_certificate, channel_name, uid, 3600)
+    except Exception as e:
+        logger.warning(f"Using test fallback token for operator: {e}")
+        token = "007eJxTYGBmy2df7tFRaKsUEDnvcPiGD22CTvM3lm/k9dj5R/FfqIECQ2JSirFhUkpyimWioUmqaVKShYGBSaJhaqpZapJpqrlBBMusrIZARob/Fl5MTAyMDCxADOIzgUlmMMkCJkUYEjN1k/PzylKLihNLMvPzdA2NjE1YGSxAAKQVohEqAACGrSjd"
+
+    return {
+        "app_id": app_id,
+        "token": token,
+        "channel_name": channel_name,
+        "operator_uid": uid
+    }
+
+
 # State Transition API: ACCEPT Escalation
 @app.post("/api/escalations/{escalation_id}/accept")
 async def accept_escalation(escalation_id: str):
@@ -539,7 +567,23 @@ async def accept_escalation(escalation_id: str):
 
     entry["status"] = "ACCEPTED"
     entry["accepted_at"] = time.time()
-    logger.info(f"Escalation {escalation_id} ACCEPTED")
+    logger.info(f"Escalation {escalation_id} ACCEPTED by operator")
+    return entry
+
+
+# State Transition API: Generic Status Update (HUMAN_CONNECTED / HUMAN_ENDED)
+@app.post("/api/escalations/{escalation_id}/status")
+async def update_escalation_status(escalation_id: str, request: Request):
+    if escalation_id not in escalations_db:
+        raise HTTPException(status_code=404, detail=f"Escalation '{escalation_id}' not found.")
+
+    body = await request.json()
+    new_status = body.get("status")
+    entry = escalations_db[escalation_id]
+
+    entry["status"] = new_status
+    entry["updated_at"] = time.time()
+    logger.info(f"Escalation {escalation_id} status updated to {new_status}")
     return entry
 
 
@@ -550,7 +594,7 @@ async def resolve_escalation(escalation_id: str):
         raise HTTPException(status_code=404, detail=f"Escalation '{escalation_id}' not found.")
 
     entry = escalations_db[escalation_id]
-    if entry["status"] not in ["WAITING", "ACCEPTED"]:
+    if entry["status"] not in ["WAITING", "ACCEPTED", "HUMAN_CONNECTED", "HUMAN_ENDED"]:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid state transition: Cannot resolve escalation in status '{entry['status']}'."
@@ -560,6 +604,244 @@ async def resolve_escalation(escalation_id: str):
     entry["resolved_at"] = time.time()
     logger.info(f"Escalation {escalation_id} RESOLVED")
     return entry
+
+
+# Mobile Photo Upload Page GET
+@app.get("/upload/{ticket_id}", response_class=HTMLResponse)
+async def upload_page(ticket_id: str):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Setu — Upload Photo Evidence for Ticket #{ticket_id}</title>
+  <style>
+    :root {{
+      --bg: #0f172a;
+      --card: #1e293b;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --success: #10b981;
+      --border: #334155;
+    }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 20px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      box-sizing: border-box;
+    }}
+    .upload-card {{
+      background-color: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      width: 100%;
+      max-width: 420px;
+      box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3);
+      text-align: center;
+    }}
+    .badge {{
+      display: inline-block;
+      background-color: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }}
+    h1 {{ font-size: 20px; margin: 0 0 8px 0; }}
+    p {{ font-size: 14px; color: var(--text-muted); margin: 0 0 20px 0; }}
+    .file-drop {{
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+      background: #0f172a;
+      cursor: pointer;
+    }}
+    input[type="file"] {{ display: none; }}
+    .file-btn {{
+      background: var(--border);
+      color: var(--text);
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      display: inline-block;
+      margin-bottom: 10px;
+    }}
+    .preview {{
+      max-width: 100%;
+      max-height: 200px;
+      border-radius: 6px;
+      margin-top: 10px;
+      display: none;
+    }}
+    .submit-btn {{
+      background-color: var(--primary);
+      color: #fff;
+      border: none;
+      width: 100%;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }}
+    .submit-btn:hover {{ background-color: var(--primary-hover); }}
+    .submit-btn:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+    .success-screen {{ display: none; }}
+    .success-icon {{ font-size: 48px; color: var(--success); margin-bottom: 12px; }}
+  </style>
+</head>
+<body>
+
+  <div class="upload-card">
+    <div id="form-screen">
+      <span class="badge">Ticket #{ticket_id}</span>
+      <h1>Upload Photo Evidence</h1>
+      <p>Attach a photo of the municipal issue to update your complaint ticket.</p>
+
+      <form id="upload-form">
+        <div class="file-drop" onclick="document.getElementById('photo-input').click()">
+          <div class="file-btn">📷 Choose or Capture Photo</div>
+          <div id="file-name" style="font-size: 12px; color: var(--text-muted);">No file selected</div>
+          <img id="preview" class="preview" alt="Preview" />
+        </div>
+        <input type="file" id="photo-input" name="photo" accept="image/*" capture="environment" required>
+
+        <button type="submit" id="submit-btn" class="submit-btn" disabled>Upload Photo Evidence</button>
+      </form>
+    </div>
+
+    <div id="success-screen" class="success-screen">
+      <div class="success-icon">✅</div>
+      <h1>Photo Uploaded Successfully!</h1>
+      <p>Your photo evidence has been attached to Freshdesk Ticket #{ticket_id}.</p>
+    </div>
+  </div>
+
+  <script>
+    const photoInput = document.getElementById('photo-input');
+    const fileNameDiv = document.getElementById('file-name');
+    const previewImg = document.getElementById('preview');
+    const submitBtn = document.getElementById('submit-btn');
+    const form = document.getElementById('upload-form');
+    const formScreen = document.getElementById('form-screen');
+    const successScreen = document.getElementById('success-screen');
+
+    photoInput.addEventListener('change', (e) => {{
+      const file = e.target.files[0];
+      if (file) {{
+        fileNameDiv.textContent = file.name;
+        submitBtn.disabled = false;
+
+        const reader = new FileReader();
+        reader.onload = (event) => {{
+          previewImg.src = event.target.result;
+          previewImg.style.display = 'block';
+        }};
+        reader.readAsDataURL(file);
+      }}
+    }});
+
+    form.addEventListener('submit', async (e) => {{
+      e.preventDefault();
+      const file = photoInput.files[0];
+      if (!file) return;
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Uploading...';
+
+      const formData = new FormData();
+      formData.append('photo', file);
+
+      try {{
+        const res = await fetch('/upload/{ticket_id}', {{
+          method: 'POST',
+          body: formData
+        }});
+
+        if (res.ok) {{
+          formScreen.style.display = 'none';
+          successScreen.style.display = 'block';
+        }} else {{
+          const err = await res.json();
+          alert('Upload failed: ' + (err.message || 'Unknown error'));
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Upload Photo Evidence';
+        }}
+      }} catch (error) {{
+        alert('Network error while uploading photo.');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Upload Photo Evidence';
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+
+
+# Photo Upload Endpoint POST
+@app.post("/upload/{ticket_id}")
+async def process_photo_upload(ticket_id: str, photo: UploadFile = File(...)):
+    raw_domain = os.environ.get("FRESHDESK_DOMAIN", "").strip()
+    freshdesk_key = os.environ.get("FRESHDESK_API_KEY", "").strip()
+
+    if not raw_domain or not freshdesk_key:
+        raise HTTPException(status_code=500, detail="Freshdesk credentials not configured on server.")
+
+    freshdesk_domain = raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
+    if not freshdesk_domain.endswith(".freshdesk.com"):
+        freshdesk_domain = f"{freshdesk_domain}.freshdesk.com"
+
+    notes_url = f"https://{freshdesk_domain}/api/v2/tickets/{ticket_id}/notes"
+
+    contents = await photo.read()
+    filename = photo.filename or "photo_evidence.jpg"
+    content_type = photo.content_type or "image/jpeg"
+
+    files = [
+        ("attachments[]", (filename, contents, content_type))
+    ]
+    data = {
+        "body": f"Photo evidence uploaded by caller for Ticket #{ticket_id} via Setu SMS upload link."
+    }
+
+    try:
+        res = requests.post(
+            notes_url,
+            data=data,
+            files=files,
+            auth=(freshdesk_key, "X"),
+            timeout=15
+        )
+
+        if res.status_code == 201:
+            logger.info(f"Successfully attached photo evidence to Freshdesk Ticket #{ticket_id}")
+            return {
+                "success": True,
+                "ticket_id": ticket_id,
+                "message": f"Photo evidence successfully attached to Freshdesk Ticket #{ticket_id}."
+            }
+        else:
+            logger.error(f"Freshdesk note attachment error status {res.status_code}: {res.text}")
+            raise HTTPException(status_code=400, detail=f"Freshdesk returned status code {res.status_code}")
+
+    except Exception as e:
+        logger.exception(f"Failed to upload attachment to Freshdesk Ticket #{ticket_id}")
+        raise HTTPException(status_code=500, detail=f"Failed to attach photo to Freshdesk: {str(e)}")
 
 
 # Tool 1 Endpoint: create_ticket
