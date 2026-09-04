@@ -13,9 +13,9 @@ import random
 import logging
 
 app = FastAPI(
-    title="Setu Municipal Helpline Backend Tools & Human Voice Handoff",
-    description="Backend tool execution server with human voice handoff, Freshdesk integration, and safety guardrails",
-    version="3.4.0"
+    title="Setu Municipal Helpline Backend & Observability Service",
+    description="Backend tool execution server with structured logging, session correlation, human voice handoff, and pilot metrics",
+    version="3.5.0"
 )
 
 # CORS Middleware Setup
@@ -36,22 +36,54 @@ WORD_TO_DIGIT = {
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
 }
 
-# In-memory persistence databases
+# ------------------------------------------------------------------------------
+# In-Memory Persistence & Observability Metrics
+# ------------------------------------------------------------------------------
 conversations_db: Dict[str, Dict[str, Any]] = {}
 escalations_db: Dict[str, Dict[str, Any]] = {}
 
+metrics_counter = {
+    "conversations_started": 0,
+    "tickets_created": 0,
+    "ticket_failures": 0,
+    "human_escalations": 0,
+    "successful_handoffs": 0,
+    "sms_sent": 0,
+    "sms_failures": 0,
+    "guardrail_escalations": 0,
+    "total_ticket_latency_ms": 0
+}
+
 
 def mask_phone(phone: Optional[str]) -> str:
-    """Masks phone number for safe logging (e.g. 6362829732 -> ******9732)."""
     if not phone or len(phone) < 4:
         return "******"
     return "******" + phone[-4:]
 
 
+def generate_session_id() -> str:
+    date_str = time.strftime("%Y%m%d")
+    unique_suffix = uuid.uuid4().hex[:6].upper()
+    return f"SETU-{date_str}-{unique_suffix}"
+
+
+def log_structured_event(event: str, session_id: str, **kwargs):
+    log_payload = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        "session_id": session_id,
+        **kwargs
+    }
+    logger.info(json.dumps(log_payload))
+
+
 def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
     if conversation_id not in conversations_db:
+        session_id = generate_session_id()
+        metrics_counter["conversations_started"] += 1
         conversations_db[conversation_id] = {
             "conversation_id": conversation_id,
+            "session_id": session_id,
             "phone": None,
             "phone_confidence": "low",
             "location": None,
@@ -64,6 +96,7 @@ def get_or_create_conversation(conversation_id: str) -> Dict[str, Any]:
             "ticket_id": None,
             "updated_at": time.time()
         }
+        log_structured_event("conversation.started", session_id, conversation_id=conversation_id)
     return conversations_db[conversation_id]
 
 
@@ -104,7 +137,7 @@ ALL_GUARDRAIL_PATTERNS = {
 SAFE_GUARDRAIL_RESPONSE = "I'm not able to help with that directly, but I'll connect you with someone who can."
 
 
-def check_and_apply_guardrails(reply_text: str) -> tuple[bool, str, Optional[str]]:
+def check_and_apply_guardrails(reply_text: str, session_id: str = "SETU-DEFAULT") -> tuple[bool, str, Optional[str]]:
     if not reply_text:
         return False, reply_text, None
 
@@ -113,7 +146,13 @@ def check_and_apply_guardrails(reply_text: str) -> tuple[bool, str, Optional[str
     for category, patterns in ALL_GUARDRAIL_PATTERNS.items():
         for pattern in patterns:
             if re.search(pattern, lowered):
-                logger.warning(f"DETERMINISTIC GUARDRAIL INTERCEPTED [{category.upper()}]: '{reply_text[:60]}...'")
+                metrics_counter["guardrail_escalations"] += 1
+                log_structured_event(
+                    "guardrail.triggered",
+                    session_id,
+                    category=category,
+                    sample=reply_text[:60]
+                )
 
                 esc_req = TransferToHumanRequest(
                     reason=f"Guardrail Intercepted: {category.title()} Advice Detected",
@@ -121,7 +160,8 @@ def check_and_apply_guardrails(reply_text: str) -> tuple[bool, str, Optional[str
                     issue_one_line=f"Restricted Advice Intercepted ({category.title()} Query)",
                     confirmed_fields={},
                     key_points=f"Backend guardrail intercepted response containing restricted advice: '{reply_text[:120]}...'",
-                    unresolved=f"Caller requested {category} assistance. Backend safety net overrode output and requested human escalation."
+                    unresolved=f"Caller requested {category} assistance. Backend safety net overrode output and requested human escalation.",
+                    session_id=session_id
                 )
                 execute_transfer_to_human(esc_req)
 
@@ -138,6 +178,7 @@ class CreateTicketRequest(BaseModel):
     location: str = Field(..., description="Location, ward, or area name")
     issue_type: str = Field(..., description="Type of issue: water, garbage, electricity, certificate, other")
     description: str = Field(..., description="Brief description of the issue")
+    session_id: Optional[str] = None
 
 
 class TransferToHumanRequest(BaseModel):
@@ -152,6 +193,7 @@ class TransferToHumanRequest(BaseModel):
     issue_type: Optional[str] = None
     description: Optional[str] = None
     channel_name: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class StatusUpdateRequest(BaseModel):
@@ -197,28 +239,30 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
     text = user_text.strip()
     lowered = text.lower()
     location_match = None
+    session_id = state.get("session_id", "SETU-DEFAULT")
 
-    # 1. Extract & Accumulate Phone Digits
     is_valid_phone, clean_phone = validate_indian_phone(text)
     if is_valid_phone:
         state["phone"] = clean_phone
         state["phone_confidence"] = "high"
+        log_structured_event("field.collected", session_id, field="phone", masked_val=mask_phone(clean_phone))
     else:
-        # Accumulate partial digits
         accum = state.get("phone_partial", "") + clean_phone
         state["phone_partial"] = accum
         is_accum_valid, clean_accum = validate_indian_phone(accum)
         if is_accum_valid:
             state["phone"] = clean_accum
             state["phone_confidence"] = "high"
+            log_structured_event("field.collected", session_id, field="phone", masked_val=mask_phone(clean_accum))
 
-    # Handle correction during confirmation or late turns
     if "no" in lowered or "wrong" in lowered or "change" in lowered or "instead" in lowered:
         state["confirmed"] = False
+        log_structured_event("confirmation.rejected", session_id, user_text=user_text)
         loc_corr = re.search(r"\b(jodhpur|jaipur|delhi|mumbai|bangalore|pune|sector\s*\d+|ward\s*\d+)\b", lowered)
         if loc_corr:
             state["location"] = loc_corr.group(0).title()
             state["location_confidence"] = "high"
+            log_structured_event("field.corrected", session_id, field="location", value=state["location"])
             return state
 
     if state["location_confidence"] != "high":
@@ -226,29 +270,36 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
         if location_match:
             state["location"] = location_match.group(0).title()
             state["location_confidence"] = "high"
+            log_structured_event("field.collected", session_id, field="location", value=state["location"])
         elif state["phone_confidence"] == "high" and not is_valid_phone:
             if len(text) >= 3 and not re.search(r"^\d+$", "".join(re.findall(r"\d", text))) and not any(k in lowered for k in ["water", "electricity", "garbage", "certificate", "yes", "no", "hello"]):
                 state["location"] = text.title()
                 state["location_confidence"] = "high"
+                log_structured_event("field.collected", session_id, field="location", value=state["location"])
 
     if "water" in lowered or "pipe" in lowered or "leak" in lowered or "drain" in lowered:
         state["issue_type"] = "water"
         state["issue_type_confidence"] = "high"
+        log_structured_event("field.collected", session_id, field="issue_type", value="water")
     elif "garbage" in lowered or "trash" in lowered or "waste" in lowered or "clean" in lowered:
         state["issue_type"] = "garbage"
         state["issue_type_confidence"] = "high"
+        log_structured_event("field.collected", session_id, field="issue_type", value="garbage")
     elif "electricity" in lowered or "power" in lowered or "light" in lowered or "current" in lowered or "generator" in lowered:
         state["issue_type"] = "electricity"
         state["issue_type_confidence"] = "high"
+        log_structured_event("field.collected", session_id, field="issue_type", value="electricity")
     elif "certificate" in lowered or "birth" in lowered or "death" in lowered or "license" in lowered:
         state["issue_type"] = "certificate"
         state["issue_type_confidence"] = "high"
+        log_structured_event("field.collected", session_id, field="issue_type", value="certificate")
 
     if state["phone_confidence"] == "high" and state["location_confidence"] == "high" and state["issue_type_confidence"] == "high":
         if not lowered.startswith("no") and lowered not in ["yes", "no", "hello", "ok", "correct", "confirm", "haan", "ha", "yes, correct"]:
             if not is_valid_phone and not location_match:
                 state["description"] = text
                 state["description_confidence"] = "high"
+                log_structured_event("field.collected", session_id, field="description", value=text[:30])
 
     if lowered in ["yes", "correct", "true", "confirm", "haan", "haa", "ha", "yes correct", "yes, correct"]:
         if (state["phone_confidence"] == "high" and
@@ -256,12 +307,15 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
             state["issue_type_confidence"] == "high" and
             state["description_confidence"] == "high"):
             state["confirmed"] = True
+            log_structured_event("confirmation.accepted", session_id)
 
     state["updated_at"] = time.time()
     return state
 
 
 def generate_next_response(state: Dict[str, Any]) -> str:
+    session_id = state.get("session_id", "SETU-DEFAULT")
+
     if state["phone_confidence"] != "high":
         return "Namaste! Welcome to Setu municipal helpline. Could you please provide your 10-digit mobile number?"
 
@@ -275,6 +329,7 @@ def generate_next_response(state: Dict[str, Any]) -> str:
         return f"Understood, issue type is {state['issue_type']}. Could you please give a brief description of the problem?"
 
     if not state["confirmed"]:
+        log_structured_event("confirmation.requested", session_id)
         return (f"Let me confirm your details: Phone {state['phone']}, Location {state['location']}, "
                 f"Issue Type {state['issue_type']}, Description '{state['description']}'. Is this information correct?")
 
@@ -283,7 +338,8 @@ def generate_next_response(state: Dict[str, Any]) -> str:
             phone=state["phone"],
             location=state["location"],
             issue_type=state["issue_type"],
-            description=state["description"]
+            description=state["description"],
+            session_id=session_id
         )
         res = execute_create_ticket(ticket_req)
         if res.get("success"):
@@ -298,7 +354,8 @@ def generate_next_response(state: Dict[str, Any]) -> str:
 # ------------------------------------------------------------------------------
 # Fast2SMS Integration Function
 # ------------------------------------------------------------------------------
-def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
+def send_sms_upload_link(phone: str, ticket_id: int, session_id: str = "SETU-DEFAULT") -> Dict[str, Any]:
+    start_time = time.time()
     api_key = os.environ.get("FAST2SMS_API_KEY", "").strip()
     raw_domain = os.environ.get("SETU_RENDER_DOMAIN", "setu-9mx9.onrender.com").strip()
     render_domain = raw_domain.replace("https://", "").replace("http://", "").rstrip("/")
@@ -306,7 +363,9 @@ def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
     upload_link = f"https://{render_domain}/upload/{ticket_id}"
 
     if os.environ.get("TEST_MODE", "").lower() in ["true", "1"]:
-        logger.info(f"[TEST_MODE] Simulating SMS to {mask_phone(phone)}. Upload link: {upload_link}")
+        duration_ms = int((time.time() - start_time) * 1000)
+        metrics_counter["sms_sent"] += 1
+        log_structured_event("sms.sent", session_id, phone=mask_phone(phone), ticket_id=ticket_id, duration_ms=duration_ms, mock=True)
         return {
             "sent": True,
             "upload_link": upload_link,
@@ -314,10 +373,12 @@ def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
         }
 
     if not api_key:
-        logger.warning(f"FAST2SMS_API_KEY not set. Skipping SMS. Photo upload link: {upload_link}")
+        duration_ms = int((time.time() - start_time) * 1000)
+        metrics_counter["sms_failures"] += 1
+        log_structured_event("sms.failed", session_id, phone=mask_phone(phone), ticket_id=ticket_id, error="key_missing", duration_ms=duration_ms)
         return {
             "sent": False,
-            "error": "fast2sms_key_missing",
+            "error_code": "SMS_ERROR",
             "upload_link": upload_link,
             "message": "FAST2SMS_API_KEY environment variable is not configured."
         }
@@ -335,21 +396,32 @@ def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
     }
 
     try:
+        log_structured_event("sms.started", session_id, phone=mask_phone(phone), ticket_id=ticket_id)
         res = requests.get(url, params=params, timeout=10)
+        duration_ms = int((time.time() - start_time) * 1000)
         res_data = res.json() if "json" in res.headers.get("content-type", "") else {"text": res.text}
-        logger.info(f"Fast2SMS API Response for {mask_phone(phone)}: {res_data}")
 
         is_success = res.status_code == 200 and isinstance(res_data, dict) and res_data.get("return") is True
+
+        if is_success:
+            metrics_counter["sms_sent"] += 1
+            log_structured_event("sms.sent", session_id, phone=mask_phone(phone), ticket_id=ticket_id, duration_ms=duration_ms)
+        else:
+            metrics_counter["sms_failures"] += 1
+            log_structured_event("sms.failed", session_id, phone=mask_phone(phone), ticket_id=ticket_id, duration_ms=duration_ms, res=res_data)
+
         return {
             "sent": is_success,
             "upload_link": upload_link,
             "fast2sms_response": res_data
         }
     except Exception as e:
-        logger.exception(f"Fast2SMS request failed for phone {mask_phone(phone)}")
+        duration_ms = int((time.time() - start_time) * 1000)
+        metrics_counter["sms_failures"] += 1
+        log_structured_event("sms.failed", session_id, phone=mask_phone(phone), ticket_id=ticket_id, error=str(e), duration_ms=duration_ms)
         return {
             "sent": False,
-            "error": str(e),
+            "error_code": "SMS_ERROR",
             "upload_link": upload_link
         }
 
@@ -358,37 +430,48 @@ def send_sms_upload_link(phone: str, ticket_id: int) -> Dict[str, Any]:
 # Tool 1: create_ticket Implementation
 # ------------------------------------------------------------------------------
 def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
+    start_time = time.time()
+    session_id = data.session_id or generate_session_id()
+
     phone_valid, clean_phone = validate_indian_phone(data.phone)
     if not phone_valid:
+        log_structured_event("ticket.creation.failed", session_id, error="invalid_phone_number")
         return {
             "success": False,
-            "error": "invalid_phone_number",
+            "error_code": "VALIDATION_ERROR",
             "message": f"'{data.phone}' is not a valid 10-digit Indian mobile number starting with 6, 7, 8, or 9."
         }
 
     clean_location = data.location.strip() if data.location else ""
     if not clean_location:
-        return {"success": False, "error": "invalid_location", "message": "Location parameter cannot be empty."}
+        log_structured_event("ticket.creation.failed", session_id, error="invalid_location")
+        return {"success": False, "error_code": "VALIDATION_ERROR", "message": "Location parameter cannot be empty."}
 
     issue_valid, clean_issue_type = validate_issue_type(data.issue_type)
     if not issue_valid:
+        log_structured_event("ticket.creation.failed", session_id, error="invalid_issue_type")
         return {
             "success": False,
-            "error": "invalid_issue_type",
+            "error_code": "VALIDATION_ERROR",
             "message": f"'{data.issue_type}' is not a recognized issue type. Allowed: water, garbage, electricity, certificate, other."
         }
 
     clean_description = data.description.strip() if data.description else ""
     if not clean_description:
-        return {"success": False, "error": "invalid_description", "message": "Description parameter cannot be empty."}
+        log_structured_event("ticket.creation.failed", session_id, error="invalid_description")
+        return {"success": False, "error_code": "VALIDATION_ERROR", "message": "Description parameter cannot be empty."}
 
     if os.environ.get("TEST_MODE", "").lower() in ["true", "1"]:
         mock_ticket_id = 9999
-        logger.info(f"[TEST_MODE] Simulating Freshdesk ticket creation #{mock_ticket_id} for phone {mask_phone(clean_phone)}")
-        sms_res = send_sms_upload_link(clean_phone, mock_ticket_id)
+        duration_ms = int((time.time() - start_time) * 1000)
+        metrics_counter["tickets_created"] += 1
+        metrics_counter["total_ticket_latency_ms"] += duration_ms
+        log_structured_event("ticket.created", session_id, ticket_id=mock_ticket_id, duration_ms=duration_ms, mock=True)
+        sms_res = send_sms_upload_link(clean_phone, mock_ticket_id, session_id)
         return {
             "success": True,
             "ticket_id": mock_ticket_id,
+            "session_id": session_id,
             "message": f"Complaint registered successfully. Ticket ID is {mock_ticket_id}.",
             "upload_link": sms_res.get("upload_link"),
             "sms_sent": sms_res.get("sent", True)
@@ -398,9 +481,11 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
     freshdesk_key = os.environ.get("FRESHDESK_API_KEY", "").strip()
 
     if not raw_domain or not freshdesk_key:
+        metrics_counter["ticket_failures"] += 1
+        log_structured_event("ticket.creation.failed", session_id, error="freshdesk_config_missing")
         return {
             "success": False,
-            "error": "freshdesk_config_missing",
+            "error_code": "FRESHDESK_ERROR",
             "message": "Freshdesk credentials (FRESHDESK_DOMAIN / FRESHDESK_API_KEY) are not set in environment variables."
         }
 
@@ -420,6 +505,7 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
     }
 
     try:
+        log_structured_event("ticket.creation.started", session_id, issue_type=clean_issue_type)
         response = requests.post(
             freshdesk_url,
             json=payload,
@@ -427,32 +513,43 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
             headers={"Content-Type": "application/json"},
             timeout=10
         )
+        duration_ms = int((time.time() - start_time) * 1000)
 
         if response.status_code == 201:
             ticket_data = response.json()
             ticket_id = ticket_data.get("id")
 
-            sms_res = send_sms_upload_link(clean_phone, ticket_id)
+            metrics_counter["tickets_created"] += 1
+            metrics_counter["total_ticket_latency_ms"] += duration_ms
+            log_structured_event("ticket.created", session_id, ticket_id=ticket_id, duration_ms=duration_ms)
+
+            sms_res = send_sms_upload_link(clean_phone, ticket_id, session_id)
 
             return {
                 "success": True,
                 "ticket_id": ticket_id,
+                "session_id": session_id,
                 "message": f"Complaint registered successfully. Ticket ID is {ticket_id}.",
                 "upload_link": sms_res.get("upload_link"),
                 "sms_sent": sms_res.get("sent", False),
                 "sms_debug": sms_res.get("fast2sms_response")
             }
         else:
+            metrics_counter["ticket_failures"] += 1
+            log_structured_event("ticket.creation.failed", session_id, status_code=response.status_code, duration_ms=duration_ms)
             return {
                 "success": False,
-                "error": "ticket_creation_failed",
+                "error_code": "FRESHDESK_ERROR",
                 "message": f"Freshdesk ticket creation failed with status code {response.status_code}."
             }
 
     except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        metrics_counter["ticket_failures"] += 1
+        log_structured_event("ticket.creation.failed", session_id, error=str(e), duration_ms=duration_ms)
         return {
             "success": False,
-            "error": "ticket_creation_failed",
+            "error_code": "FRESHDESK_ERROR",
             "message": f"Failed to connect to Freshdesk server: {str(e)}"
         }
 
@@ -461,6 +558,9 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
 # Tool 2: transfer_to_human Implementation
 # ------------------------------------------------------------------------------
 def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
+    start_time = time.time()
+    session_id = data.session_id or generate_session_id()
+
     clean_reason = data.reason.strip() if data.reason else "Out of scope / low confidence request"
     clean_summary = data.summary.strip() if data.summary else (data.key_points or "Caller requested human agent")
     clean_issue_one_line = (data.issue_one_line or clean_summary or "Municipal issue escalation").strip()
@@ -479,6 +579,7 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
     escalation_entry = {
         "type": "human_escalation",
         "escalation_id": escalation_id,
+        "session_id": session_id,
         "channel_name": channel_name_val,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "reason": clean_reason,
@@ -504,14 +605,21 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
 
     # Persist in-memory database
     escalations_db[escalation_id] = escalation_entry
+    metrics_counter["human_escalations"] += 1
 
-    if os.environ.get("TEST_MODE", "").lower() in ["true", "1"]:
-        logger.info(f"[TEST_MODE] MOCK RTM publish to 'setu-human-escalations': {escalation_id}")
-    else:
-        logger.info(f"[REAL RTM] Escalation {escalation_id} published to channel 'setu-human-escalations'")
+    duration_ms = int((time.time() - start_time) * 1000)
+    log_structured_event(
+        "escalation.created",
+        session_id,
+        escalation_id=escalation_id,
+        reason=clean_reason,
+        channel_name=channel_name_val,
+        duration_ms=duration_ms
+    )
 
     print("\n========== HUMAN ESCALATION ==========")
     print(f"Escalation ID:   {escalation_id}")
+    print(f"Session ID:      {session_id}")
     print(f"Status:          WAITING")
     print(f"Reason:          {clean_reason}")
     print(f"Issue One-Line:  {clean_issue_one_line}")
@@ -524,6 +632,7 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
         "success": True,
         "status": "human_escalation_requested",
         "escalation_id": escalation_id,
+        "session_id": session_id,
         "channel_name": channel_name_val,
         "message": "Human escalation logged and published to Agora RTM successfully."
     }
@@ -545,17 +654,36 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "Setu Backend", "version": "3.4.0"}
+    return {"status": "ok", "service": "Setu Backend", "version": "3.5.0"}
+
+
+@app.get("/api/metrics")
+async def get_metrics():
+    """Observability pilot metrics endpoint."""
+    total_created = metrics_counter["tickets_created"]
+    avg_latency = (
+        int(metrics_counter["total_ticket_latency_ms"] / total_created)
+        if total_created > 0 else 0
+    )
+    return {
+        "conversations_started": metrics_counter["conversations_started"],
+        "tickets_created": metrics_counter["tickets_created"],
+        "ticket_failures": metrics_counter["ticket_failures"],
+        "human_escalations": metrics_counter["human_escalations"],
+        "successful_handoffs": metrics_counter["successful_handoffs"],
+        "sms_sent": metrics_counter["sms_sent"],
+        "sms_failures": metrics_counter["sms_failures"],
+        "guardrail_escalations": metrics_counter["guardrail_escalations"],
+        "avg_ticket_latency_ms": avg_latency
+    }
 
 
 @app.get("/api/env_check")
 async def env_check():
     return {
-        "AGORA_APP_ID": "CONFIGURED" if os.environ.get("AGORA_APP_ID") else "DEFAULT_FALLBACK",
-        "AGORA_APP_CERT": "CONFIGURED" if os.environ.get("AGORA_APP_CERTIFICATE") else "DEFAULT_FALLBACK",
-        "FRESHDESK_DOMAIN": "CONFIGURED" if os.environ.get("FRESHDESK_DOMAIN") else "MISSING",
-        "FRESHDESK_API_KEY": "CONFIGURED" if os.environ.get("FRESHDESK_API_KEY") else "MISSING",
-        "FAST2SMS_API_KEY": "CONFIGURED" if os.environ.get("FAST2SMS_API_KEY") else "OPTIONAL",
+        "freshdesk": "configured" if os.environ.get("FRESHDESK_DOMAIN") and os.environ.get("FRESHDESK_API_KEY") else "missing",
+        "fast2sms": "configured" if os.environ.get("FAST2SMS_API_KEY") else "optional",
+        "agora": "configured" if os.environ.get("AGORA_APP_ID") else "configured_fallback",
         "TEST_MODE": os.environ.get("TEST_MODE", "false")
     }
 
@@ -578,9 +706,14 @@ async def get_escalations():
 # Generate Operator RTC Token Endpoint
 @app.get("/api/get_operator_token")
 async def get_operator_token(channel_name: str = Query(...), escalation_id: Optional[str] = Query(default=None), operator_uid: Optional[int] = Query(default=None)):
+    start_time = time.time()
+    session_id = "SETU-TOKEN"
+
     if escalation_id and escalation_id in escalations_db:
         entry = escalations_db[escalation_id]
+        session_id = entry.get("session_id", session_id)
         if entry["status"] == "RESOLVED":
+            log_structured_event("rtc.token_failed", session_id, error="resolved_escalation", escalation_id=escalation_id)
             raise HTTPException(status_code=400, detail="Cannot generate operator token for resolved escalation.")
 
     app_id = os.environ.get("AGORA_APP_ID", "abd31bdcd9a14e5bb8004a1ee6eb5e70")
@@ -593,6 +726,9 @@ async def get_operator_token(channel_name: str = Query(...), escalation_id: Opti
     except Exception as e:
         logger.warning(f"Using test fallback token for operator: {e}")
         token = "007eJxTYGBmy2df7tFRaKsUEDnvcPiGD22CTvM3lm/k9dj5R/FfqIECQ2JSirFhUkpyimWioUmqaVKShYGBSaJhaqpZapJpqrlBBMusrIZARob/Fl5MTAyMDCxADOIzgUlmMMkCJkUYEjN1k/PzylKLihNLMvPzdA2NjE1YGSxAAKQVohEqAACGrSjd"
+
+    duration_ms = int((time.time() - start_time) * 1000)
+    log_structured_event("rtc.token_created", session_id, channel_name=channel_name, operator_uid=uid, duration_ms=duration_ms)
 
     return {
         "app_id": app_id,
@@ -609,10 +745,13 @@ async def accept_escalation(escalation_id: str):
         raise HTTPException(status_code=404, detail=f"Escalation '{escalation_id}' not found.")
 
     entry = escalations_db[escalation_id]
+    session_id = entry.get("session_id", "SETU-ACCEPT")
+
     if entry["status"] == "ACCEPTED":
         return {"message": "Escalation already accepted", "escalation": entry}
 
     if entry["status"] not in ["WAITING"]:
+        log_structured_event("escalation.accept_failed", session_id, escalation_id=escalation_id, current_status=entry["status"])
         raise HTTPException(
             status_code=400,
             detail=f"Invalid state transition: Cannot accept escalation in status '{entry['status']}'."
@@ -620,7 +759,7 @@ async def accept_escalation(escalation_id: str):
 
     entry["status"] = "ACCEPTED"
     entry["accepted_at"] = time.time()
-    logger.info(f"Escalation {escalation_id} ACCEPTED by operator")
+    log_structured_event("escalation.accepted", session_id, escalation_id=escalation_id)
     return entry
 
 
@@ -633,13 +772,20 @@ async def update_escalation_status(escalation_id: str, request: Request):
     body = await request.json()
     new_status = body.get("status")
     entry = escalations_db[escalation_id]
+    session_id = entry.get("session_id", "SETU-STATUS")
 
     if entry["status"] == "RESOLVED" and new_status in ["ACCEPTED", "HUMAN_CONNECTED"]:
         raise HTTPException(status_code=400, detail="Cannot transition resolved escalation back to connected status.")
 
     entry["status"] = new_status
     entry["updated_at"] = time.time()
-    logger.info(f"Escalation {escalation_id} status updated to {new_status}")
+
+    if new_status == "HUMAN_CONNECTED":
+        metrics_counter["successful_handoffs"] += 1
+        log_structured_event("escalation.human_connected", session_id, escalation_id=escalation_id)
+    elif new_status == "HUMAN_ENDED":
+        log_structured_event("escalation.human_ended", session_id, escalation_id=escalation_id)
+
     return entry
 
 
@@ -650,6 +796,8 @@ async def resolve_escalation(escalation_id: str):
         raise HTTPException(status_code=404, detail=f"Escalation '{escalation_id}' not found.")
 
     entry = escalations_db[escalation_id]
+    session_id = entry.get("session_id", "SETU-RESOLVE")
+
     if entry["status"] not in ["WAITING", "ACCEPTED", "HUMAN_CONNECTED", "HUMAN_ENDED"]:
         raise HTTPException(
             status_code=400,
@@ -658,7 +806,7 @@ async def resolve_escalation(escalation_id: str):
 
     entry["status"] = "RESOLVED"
     entry["resolved_at"] = time.time()
-    logger.info(f"Escalation {escalation_id} RESOLVED")
+    log_structured_event("escalation.resolved", session_id, escalation_id=escalation_id)
     return entry
 
 
@@ -679,7 +827,7 @@ async def create_ticket_endpoint(request: Request):
     try:
         ticket_req = CreateTicketRequest(**body)
     except Exception as e:
-        return {"success": False, "error": "invalid_request_format", "message": f"Missing parameters: {str(e)}"}
+        return {"success": False, "error_code": "VALIDATION_ERROR", "message": f"Missing parameters: {str(e)}"}
 
     return execute_create_ticket(ticket_req)
 
@@ -701,7 +849,7 @@ async def transfer_to_human_endpoint(request: Request):
     try:
         transfer_req = TransferToHumanRequest(**body)
     except Exception as e:
-        return {"success": False, "error": "invalid_request_format", "message": f"Missing parameters: {str(e)}"}
+        return {"success": False, "error_code": "VALIDATION_ERROR", "message": f"Missing parameters: {str(e)}"}
 
     return execute_transfer_to_human(transfer_req)
 
@@ -711,11 +859,13 @@ async def transfer_to_human_endpoint(request: Request):
 async def check_guardrails_endpoint(request: Request):
     body = await request.json()
     text = body.get("text", "")
-    intercepted, safe_reply, category = check_and_apply_guardrails(text)
+    session_id = body.get("session_id", generate_session_id())
+    intercepted, safe_reply, category = check_and_apply_guardrails(text, session_id)
     return {
         "intercepted": intercepted,
         "reply": safe_reply,
-        "category": category
+        "category": category,
+        "session_id": session_id
     }
 
 

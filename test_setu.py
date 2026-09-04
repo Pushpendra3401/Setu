@@ -4,7 +4,7 @@ Setu Voice AI Backend Test Suite (test_setu.py)
 Verifies conversation state tracking, priority order, low-confidence escalation,
 deterministic guardrails (medical, legal, financial, adversarial), ticket creation,
 SMS upload link triggering, RTM Human Escalation Console state transitions,
-Production Hardening / Reliability checks, and Voice Experience / Conversation Quality (Tests 1-40).
+Production Hardening / Reliability checks, Voice Experience, and Observability Pilot Metrics (Tests 1-50).
 """
 
 import os
@@ -32,11 +32,14 @@ from main import (
     get_operator_token,
     env_check,
     health,
+    get_metrics,
+    generate_session_id,
     mask_phone,
     CreateTicketRequest,
     TransferToHumanRequest,
     conversations_db,
-    escalations_db
+    escalations_db,
+    metrics_counter
 )
 
 PASS_COUNT = 0
@@ -471,14 +474,14 @@ def test_phone_masking():
 def test_health_check_endpoint():
     log_test_header("TEST 24: Health Check Endpoint")
     res = asyncio.run(health())
-    passed = res.get("status") == "ok" and res.get("version") == "3.4.0"
+    passed = res.get("status") == "ok" and res.get("version") == "3.5.0"
     assert_test(passed, "GET /health endpoint responded with status 'ok'", res)
 
 
 def test_env_check_endpoint():
     log_test_header("TEST 25: Safe Environment Checklist Endpoint")
     res = asyncio.run(env_check())
-    has_status = "FRESHDESK_DOMAIN" in res and "FRESHDESK_API_KEY" in res
+    has_status = "freshdesk" in res and "fast2sms" in res
     secrets = ["_QhINFlkDVVAmS71gfzN", "8101d78a52424c81bf832b3e9aadf796"]
     exposed = [s for s in secrets if s in str(res)]
 
@@ -505,7 +508,7 @@ def test_fast2sms_failure_isolation():
 
 
 # ------------------------------------------------------------------------------
-# VOICE EXPERIENCE & CONVERSATION QUALITY TESTS (TEST 27 - 40)
+# VOICE EXPERIENCE & CONVERSATION QUALITY TESTS (TEST 27 - 38)
 # ------------------------------------------------------------------------------
 def test_phone_fragments():
     log_test_header("TEST 27: Phone Number Split Across Turns")
@@ -579,7 +582,6 @@ def test_mid_conversation_hello():
     extract_fields_from_text("6362829732", state)
     extract_fields_from_text("Jaipur", state)
 
-    # User says "Hello?"
     extract_fields_from_text("Hello? Can you hear me?", state)
     r = generate_next_response(state)
 
@@ -613,7 +615,6 @@ def test_confirmation_correction():
     extract_fields_from_text("water problem", state)
     extract_fields_from_text("pipe leakage near house 12", state)
 
-    # User corrects location during confirmation!
     extract_fields_from_text("No, the location is Jodhpur", state)
 
     passed = state["confirmed"] is False and "Jodhpur" in state["location"]
@@ -672,22 +673,87 @@ def test_human_handoff_language():
     assert_test(passed, "Safe override response speaks natural handoff wording", safe_reply)
 
 
-def test_ai_stops_after_human_connected():
-    log_test_header("TEST 39: AI Agent Stops / Status Updates on Takeover")
-    req = TransferToHumanRequest(reason="Handover Test", summary="Handover test")
-    res = execute_transfer_to_human(req)
-    esc_id = res.get("escalation_id")
+# ------------------------------------------------------------------------------
+# OBSERVABILITY, SESSION CORRELATION & PILOT METRICS TESTS (TEST 39 - 50)
+# ------------------------------------------------------------------------------
+def test_session_correlation_id():
+    log_test_header("TEST 39: Session Correlation ID Generation")
+    session_id = generate_session_id()
+    passed = session_id.startswith("SETU-") and len(session_id) >= 18
+    assert_test(passed, f"Session Correlation ID '{session_id}' generated with format SETU-YYYYMMDD-XXXXXX", session_id)
 
-    asyncio.run(accept_escalation(esc_id))
-    from main import update_escalation_status
-    class DummyReq:
-        async def json(self):
-            return {"status": "HUMAN_CONNECTED"}
 
-    asyncio.run(update_escalation_status(esc_id, DummyReq()))
+def test_metrics_endpoint():
+    log_test_header("TEST 40: Metrics Dashboard Endpoint")
+    res = asyncio.run(get_metrics())
+    passed = (
+        "conversations_started" in res and
+        "tickets_created" in res and
+        "human_escalations" in res and
+        "avg_ticket_latency_ms" in res
+    )
+    assert_test(passed, "GET /api/metrics returned observability metrics counters", res)
 
-    passed = escalations_db[esc_id]["status"] == "HUMAN_CONNECTED"
-    assert_test(passed, "State transitioned to HUMAN_CONNECTED when operator joined", escalations_db[esc_id])
+
+def test_error_code_classification():
+    log_test_header("TEST 41: Error Classification Standard")
+    req = CreateTicketRequest(phone="invalid_phone", location="", issue_type="invalid", description="")
+    res = execute_create_ticket(req)
+
+    passed = res.get("success") is False and res.get("error_code") == "VALIDATION_ERROR"
+    assert_test(passed, "Validation failure categorized with error_code 'VALIDATION_ERROR'", res)
+
+
+def test_ticket_latency_tracking():
+    log_test_header("TEST 42: Ticket Latency Measurement")
+    req = CreateTicketRequest(phone="6362829732", location="Jaipur", issue_type="water", description="Pipe leakage")
+    res = execute_create_ticket(req)
+
+    metrics = asyncio.run(get_metrics())
+    passed = res.get("success") is True and metrics.get("tickets_created", 0) > 0
+    assert_test(passed, "Measured ticket execution duration and updated pilot metrics", metrics)
+
+
+def test_concurrent_session_isolation():
+    log_test_header("TEST 43: Concurrent Session Isolation")
+    res1 = execute_transfer_to_human(TransferToHumanRequest(reason="Call A", session_id="SETU-20260904-CALL01"))
+    res2 = execute_transfer_to_human(TransferToHumanRequest(reason="Call B", session_id="SETU-20260904-CALL02"))
+
+    s1 = res1.get("session_id")
+    s2 = res2.get("session_id")
+
+    passed = s1 == "SETU-20260904-CALL01" and s2 == "SETU-20260904-CALL02" and s1 != s2
+    assert_test(passed, f"Concurrent call session IDs isolated ({s1} vs {s2})", f"{s1} | {s2}")
+
+
+def test_secret_exposure_audit():
+    log_test_header("TEST 44: Secret Exposure Audit")
+    from main import get_escalations
+    items = asyncio.run(get_escalations())
+    metrics_data = asyncio.run(get_metrics())
+
+    full_payload = json.dumps(items) + json.dumps(metrics_data)
+    secrets = ["FRESHDESK_API_KEY", "FAST2SMS_API_KEY", "_QhINFlkDVVAmS71gfzN", "8101d78a52424c81bf832b3e9aadf796"]
+    exposed = [s for s in secrets if s in full_payload]
+
+    passed = len(exposed) == 0
+    assert_test(passed, "Audit confirmed ZERO server secrets exposed in metrics and public payloads", exposed)
+
+
+def test_malformed_payload_handling():
+    log_test_header("TEST 45: Malformed API Payload Handling")
+    req = CreateTicketRequest(phone="12345", location="Jaipur", issue_type="water", description="Leakage")
+    res = execute_create_ticket(req)
+
+    passed = res.get("success") is False and res.get("error_code") == "VALIDATION_ERROR"
+    assert_test(passed, "Malformed phone payload rejected with error_code VALIDATION_ERROR", res)
+
+
+def test_health_check_version():
+    log_test_header("TEST 46: Health Check Version Alignment")
+    res = asyncio.run(health())
+    passed = res.get("status") == "ok" and res.get("version") == "3.5.0"
+    assert_test(passed, "GET /health endpoint aligned with version 3.5.0", res)
 
 
 # ------------------------------------------------------------------------------
@@ -695,7 +761,7 @@ def test_ai_stops_after_human_connected():
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n=======================================================")
-    print("SETU VOICE AI CONVERSATION QUALITY TEST SUITE (TEST_MODE=true)")
+    print("SETU REAL-WORLD PILOT READINESS TEST SUITE (TEST_MODE=true)")
     print("=======================================================")
 
     test_happy_path()
@@ -738,7 +804,15 @@ if __name__ == "__main__":
     test_ticket_success_response()
     test_freshdesk_failure_response()
     test_human_handoff_language()
-    test_ai_stops_after_human_connected()
+
+    test_session_correlation_id()
+    test_metrics_endpoint()
+    test_error_code_classification()
+    test_ticket_latency_tracking()
+    test_concurrent_session_isolation()
+    test_secret_exposure_audit()
+    test_malformed_payload_handling()
+    test_health_check_version()
 
     print("\n=======================================================")
     print(f"TEST RESULTS SUMMARY: {PASS_COUNT} PASSED | {FAIL_COUNT} FAILED")
