@@ -304,7 +304,9 @@ def extract_fields_from_text(user_text: str, state: Dict[str, Any]) -> Dict[str,
                 state["description_confidence"] = "high"
                 log_structured_event("field.collected", session_id, field="description", value=text[:30])
 
-    if lowered in ["yes", "correct", "true", "confirm", "haan", "haa", "ha", "yes correct", "yes, correct"]:
+    # Handle affirmative confirmation ("Yes", "Yes it is correct", "Correct", "Haan", "Right")
+    is_positive_confirm = any(p in lowered for p in ["yes", "correct", "confirm", "haan", "haa", "sahi", "true", "right", "go ahead"]) and not any(neg in lowered for neg in ["no", "not", "wrong", "change", "dont", "don't"])
+    if is_positive_confirm:
         if (state["phone_confidence"] == "high" and
             state["location_confidence"] == "high" and
             state["issue_type_confidence"] == "high" and
