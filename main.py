@@ -36,9 +36,10 @@ WORD_TO_DIGIT = {
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
 }
 
-# In-memory persistence databases & Pilot Feedback
+# In-memory persistence & deduplication databases
 conversations_db: Dict[str, Dict[str, Any]] = {}
 escalations_db: Dict[str, Dict[str, Any]] = {}
+processed_tickets_db: Dict[str, Dict[str, Any]] = {}
 pilot_feedback_list: List[Dict[str, Any]] = []
 
 metrics_counter = {
@@ -463,6 +464,13 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
         log_structured_event("ticket.creation.failed", session_id, error="invalid_description")
         return {"success": False, "error_code": "VALIDATION_ERROR", "message": "Description parameter cannot be empty."}
 
+    # Duplicate ticket protection by session_id or phone+location+issue
+    dedup_key = f"{session_id}_{clean_phone}_{clean_location}_{clean_issue_type}"
+    if dedup_key in processed_tickets_db:
+        existing = processed_tickets_db[dedup_key]
+        log_structured_event("ticket.duplicate_prevented", session_id, ticket_id=existing.get("ticket_id"))
+        return existing
+
     if os.environ.get("TEST_MODE", "").lower() in ["true", "1"]:
         mock_ticket_id = 9999
         duration_ms = int((time.time() - start_time) * 1000)
@@ -470,7 +478,8 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
         metrics_counter["total_ticket_latency_ms"] += duration_ms
         log_structured_event("ticket.created", session_id, ticket_id=mock_ticket_id, duration_ms=duration_ms, mock=True)
         sms_res = send_sms_upload_link(clean_phone, mock_ticket_id, session_id)
-        return {
+
+        result_payload = {
             "success": True,
             "ticket_id": mock_ticket_id,
             "session_id": session_id,
@@ -478,6 +487,8 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
             "upload_link": sms_res.get("upload_link"),
             "sms_sent": sms_res.get("sent", True)
         }
+        processed_tickets_db[dedup_key] = result_payload
+        return result_payload
 
     raw_domain = os.environ.get("FRESHDESK_DOMAIN", "").strip()
     freshdesk_key = os.environ.get("FRESHDESK_API_KEY", "").strip()
@@ -527,7 +538,7 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
 
             sms_res = send_sms_upload_link(clean_phone, ticket_id, session_id)
 
-            return {
+            result_payload = {
                 "success": True,
                 "ticket_id": ticket_id,
                 "session_id": session_id,
@@ -536,6 +547,8 @@ def execute_create_ticket(data: CreateTicketRequest) -> Dict[str, Any]:
                 "sms_sent": sms_res.get("sent", False),
                 "sms_debug": sms_res.get("fast2sms_response")
             }
+            processed_tickets_db[dedup_key] = result_payload
+            return result_payload
         else:
             metrics_counter["ticket_failures"] += 1
             log_structured_event("ticket.creation.failed", session_id, status_code=response.status_code, duration_ms=duration_ms)
