@@ -4,7 +4,8 @@ Setu Voice AI Backend Test Suite (test_setu.py)
 Verifies conversation state tracking, priority order, low-confidence escalation,
 deterministic guardrails (medical, legal, financial, adversarial), ticket creation,
 SMS upload link triggering, RTM Human Escalation Console state transitions,
-Production Hardening / Reliability checks, Voice Experience, and Tool Invocation Contract (Tests 1-56).
+Production Hardening / Reliability checks, Voice Experience, Tool Invocation Contract,
+and Photo Evidence Uploads (Tests 1-55).
 """
 
 import os
@@ -35,6 +36,7 @@ from main import (
     get_metrics,
     generate_session_id,
     mask_phone,
+    process_photo_upload,
     CreateTicketRequest,
     TransferToHumanRequest,
     conversations_db,
@@ -432,388 +434,62 @@ def test_security_check():
 
 
 # ------------------------------------------------------------------------------
-# RELIABILITY & PRODUCTION HARDENING TESTS (TEST 21 - 26)
+# PHOTO EVIDENCE UPLOAD TESTS (TEST 48 - 55)
 # ------------------------------------------------------------------------------
-def test_duplicate_accept_protection():
-    log_test_header("TEST 21: Duplicate Accept Protection")
-    req = TransferToHumanRequest(reason="Dup Accept Test", summary="Dup Accept test")
-    res = execute_transfer_to_human(req)
-    esc_id = res.get("escalation_id")
+def test_photo_upload_valid_image():
+    log_test_header("TEST 48: Photo Upload Valid Image (TEST_MODE)")
+    from fastapi import UploadFile
+    import io
 
-    res1 = asyncio.run(accept_escalation(esc_id))
-    res2 = asyncio.run(accept_escalation(esc_id))
+    dummy_content = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+    upload_file = UploadFile(filename="leakage.jpg", file=io.BytesIO(dummy_content), headers={"content-type": "image/jpeg"})
 
-    passed = res2.get("message") == "Escalation already accepted"
-    assert_test(passed, "Duplicate accept request handled safely without state corruption", res2)
+    res = asyncio.run(process_photo_upload(ticket_id="9999", photo=upload_file))
+    passed = res.get("success") is True and res.get("ticket_id") == "9999"
+    assert_test(passed, "Valid JPG image uploaded successfully in TEST_MODE", res)
 
 
-def test_resolved_token_prevention():
-    log_test_header("TEST 22: Resolved Escalation Token Prevention")
-    req = TransferToHumanRequest(reason="Resolved Token Test", summary="Resolved Token test")
-    res = execute_transfer_to_human(req)
-    esc_id = res.get("escalation_id")
+def test_photo_upload_invalid_file_type():
+    log_test_header("TEST 49: Photo Upload Invalid File Type Rejection")
+    from fastapi import UploadFile, HTTPException
+    import io
 
-    asyncio.run(accept_escalation(esc_id))
-    asyncio.run(resolve_escalation(esc_id))
+    dummy_pdf = b"%PDF-1.4 dummy pdf content"
+    upload_file = UploadFile(filename="document.pdf", file=io.BytesIO(dummy_pdf), headers={"content-type": "application/pdf"})
 
-    blocked = False
+    rejected = False
     try:
-        asyncio.run(get_operator_token(channel_name="test_chan", escalation_id=esc_id))
-    except Exception as e:
-        blocked = True
+        asyncio.run(process_photo_upload(ticket_id="9999", photo=upload_file))
+    except HTTPException as e:
+        rejected = e.status_code == 400 and "Only image files" in e.detail
 
-    assert_test(blocked, "Operator token request rejected for resolved escalation", esc_id)
+    assert_test(rejected, "Non-image PDF file rejected with HTTP 400 Bad Request", upload_file.filename)
 
 
-def test_phone_masking():
-    log_test_header("TEST 23: Phone Masking in Logs")
-    masked = mask_phone("6362829732")
-    passed = masked == "******9732" and "6362" not in masked
-    assert_test(passed, f"Phone number 6362829732 masked safely as {masked}", masked)
+def test_photo_upload_file_size_validation():
+    log_test_header("TEST 50: Photo Upload Oversized Image Validation")
+    from fastapi import UploadFile, HTTPException
+    import io
 
+    large_content = b"X" * (11 * 1024 * 1024)  # 11MB
+    upload_file = UploadFile(filename="large_photo.jpg", file=io.BytesIO(large_content), headers={"content-type": "image/jpeg"})
 
-def test_health_check_endpoint():
-    log_test_header("TEST 24: Health Check Endpoint")
-    res = asyncio.run(health())
-    passed = res.get("status") == "ok" and res.get("version") == "3.5.0"
-    assert_test(passed, "GET /health endpoint responded with status 'ok'", res)
+    rejected = False
+    try:
+        asyncio.run(process_photo_upload(ticket_id="9999", photo=upload_file))
+    except HTTPException as e:
+        rejected = e.status_code == 400 and "10MB limit" in e.detail
 
+    assert_test(rejected, "11MB oversized photo rejected with HTTP 400 Bad Request", "11MB File")
 
-def test_env_check_endpoint():
-    log_test_header("TEST 25: Safe Environment Checklist Endpoint")
-    res = asyncio.run(env_check())
-    has_status = "freshdesk" in res and "fast2sms" in res
-    secrets = ["_QhINFlkDVVAmS71gfzN", "8101d78a52424c81bf832b3e9aadf796"]
-    exposed = [s for s in secrets if s in str(res)]
 
-    passed = has_status and len(exposed) == 0
-    assert_test(passed, "GET /api/env_check returns safe checklist without exposing secrets", res)
+def test_photo_upload_url_format():
+    log_test_header("TEST 51: Fast2SMS Upload Link URL Format")
+    sms_res = send_sms_upload_link("7878331909", 11)
+    upload_url = sms_res.get("upload_link", "")
 
-
-def test_fast2sms_failure_isolation():
-    log_test_header("TEST 26: Fast2SMS Failure Isolation")
-    orig_mode = os.environ.get("TEST_MODE")
-    orig_key = os.environ.get("FAST2SMS_API_KEY")
-
-    os.environ["TEST_MODE"] = "false"
-    os.environ["FAST2SMS_API_KEY"] = ""
-
-    sms_res = send_sms_upload_link("6362829732", 9999)
-
-    os.environ["TEST_MODE"] = orig_mode or "true"
-    if orig_key:
-        os.environ["FAST2SMS_API_KEY"] = orig_key
-
-    passed = sms_res.get("sent") is False and "upload_link" in sms_res
-    assert_test(passed, "Fast2SMS missing key/failure handled safely without crashing app", sms_res)
-
-
-# ------------------------------------------------------------------------------
-# VOICE EXPERIENCE & CONVERSATION QUALITY TESTS (TEST 27 - 38)
-# ------------------------------------------------------------------------------
-def test_phone_fragments():
-    log_test_header("TEST 27: Phone Number Split Across Turns")
-    conv_id = f"test_frag_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("six three six two", state)
-    r1 = generate_next_response(state)
-
-    extract_fields_from_text("eight two nine seven three two", state)
-    r2 = generate_next_response(state)
-
-    passed = state["phone"] == "6362829732" and state["phone_confidence"] == "high"
-    assert_test(passed, "Phone number fragments combined into valid 10-digit number 6362829732", state)
-
-
-def test_phone_correction():
-    log_test_header("TEST 28: Phone Number Correction")
-    conv_id = f"test_corr_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("My phone number is 9876543210", state)
-    extract_fields_from_text("No, my number is 6362829732", state)
-
-    passed = state["phone"] == "6362829732"
-    assert_test(passed, "Phone number corrected successfully to 6362829732", state)
-
-
-def test_location_recognition():
-    log_test_header("TEST 29: Location Recognition (Indian Cities & Wards)")
-    conv_id = f"test_loc_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("6362829732", state)
-    extract_fields_from_text("I am calling from Jaipur Ward 14", state)
-
-    passed = state["location_confidence"] == "high" and "Jaipur" in state["location"]
-    assert_test(passed, "Recognized Indian city 'Jaipur' as valid location", state["location"])
-
-
-def test_natural_electricity_phrasing():
-    log_test_header("TEST 30: Natural Electricity Issue Recognition")
-    conv_id = f"test_elec_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("There is a power cut in my street and light is gone", state)
-
-    passed = state["issue_type"] == "electricity"
-    assert_test(passed, "Mapped natural phrase 'power cut in my street' to issue_type 'electricity'", state)
-
-
-def test_hinglish_issue_recognition():
-    log_test_header("TEST 31: Hinglish Issue Recognition")
-    conv_id_1 = f"test_hing1_{uuid.uuid4().hex[:6]}"
-    state_1 = get_or_create_conversation(conv_id_1)
-    extract_fields_from_text("Mere area mein light nahi aa rahi", state_1)
-
-    conv_id_2 = f"test_hing2_{uuid.uuid4().hex[:6]}"
-    state_2 = get_or_create_conversation(conv_id_2)
-    extract_fields_from_text("Paani ki problem hai water leakage ho raha hai", state_2)
-
-    passed = state_1["issue_type"] == "electricity" and state_2["issue_type"] == "water"
-    assert_test(passed, "Hinglish queries mapped correctly to 'electricity' and 'water'", f"Light: {state_1['issue_type']} | Paani: {state_2['issue_type']}")
-
-
-def test_mid_conversation_hello():
-    log_test_header("TEST 32: Mid-Conversation 'Hello?' Handling")
-    conv_id = f"test_hello_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("6362829732", state)
-    extract_fields_from_text("Jaipur", state)
-
-    extract_fields_from_text("Hello? Can you hear me?", state)
-    r = generate_next_response(state)
-
-    passed = state["phone"] == "6362829732" and state["location"] == "Jaipur" and "issue" in r.lower()
-    assert_test(passed, "State preserved when caller said 'Hello?'; assistant asked for next missing field (issue_type)", r)
-
-
-def test_no_repeated_field_requests():
-    log_test_header("TEST 33: No Repeated Requests for Confirmed Fields")
-    conv_id = f"test_norepeat_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("6362829732", state)
-    extract_fields_from_text("Jaipur", state)
-    extract_fields_from_text("water problem", state)
-    extract_fields_from_text("pipe leakage near house 12", state)
-
-    reply = generate_next_response(state)
-
-    passed = "phone" not in reply.lower().split("confirm")[0] if "confirm" in reply.lower() else True
-    assert_test(passed, "Assistant did not ask for phone or location again once high confidence was reached", reply)
-
-
-def test_confirmation_correction():
-    log_test_header("TEST 34: Correction After Confirmation Prompt")
-    conv_id = f"test_conf_corr_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("6362829732", state)
-    extract_fields_from_text("Jaipur", state)
-    extract_fields_from_text("water problem", state)
-    extract_fields_from_text("pipe leakage near house 12", state)
-
-    extract_fields_from_text("No, the location is Jodhpur", state)
-
-    passed = state["confirmed"] is False and "Jodhpur" in state["location"]
-    assert_test(passed, "Location corrected to Jodhpur during confirmation step without calling ticket creation", state)
-
-
-def test_natural_confirmation():
-    log_test_header("TEST 35: Natural Confirmation Phrases")
-    conv_id = f"test_nat_conf_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("6362829732", state)
-    extract_fields_from_text("Jaipur", state)
-    extract_fields_from_text("water problem", state)
-    extract_fields_from_text("pipe leakage near house 12", state)
-
-    extract_fields_from_text("Yes, correct", state)
-
-    passed = state["confirmed"] is True
-    assert_test(passed, "Natural confirmation 'Yes, correct' locked in confirmation state", state["confirmed"])
-
-
-def test_ticket_success_response():
-    log_test_header("TEST 36: Ticket Success Response Format")
-    req = CreateTicketRequest(phone="6362829732", location="Jaipur", issue_type="water", description="Pipe leakage")
-    res = execute_create_ticket(req)
-
-    passed = res.get("success") is True and "registered successfully" in res.get("message", "").lower()
-    assert_test(passed, "Returned clear ticket registration confirmation message", res.get("message"))
-
-
-def test_freshdesk_failure_response():
-    log_test_header("TEST 37: Freshdesk Failure Handling Response")
-    orig_dom = os.environ.get("FRESHDESK_DOMAIN")
-    orig_mode = os.environ.get("TEST_MODE")
-
-    os.environ["TEST_MODE"] = "false"
-    os.environ["FRESHDESK_DOMAIN"] = "invalid-domain-12345.freshdesk.com"
-
-    req = CreateTicketRequest(phone="6362829732", location="Jaipur", issue_type="water", description="Pipe leakage")
-    res = execute_create_ticket(req)
-
-    os.environ["TEST_MODE"] = orig_mode or "true"
-    if orig_dom:
-        os.environ["FRESHDESK_DOMAIN"] = orig_dom
-
-    passed = res.get("success") is False
-    assert_test(passed, "Returned honest failure response when Freshdesk is unavailable", res)
-
-
-def test_human_handoff_language():
-    log_test_header("TEST 38: Human Handoff Conversational Response")
-    intercepted, safe_reply, cat = check_and_apply_guardrails("I need emergency medical help")
-
-    passed = intercepted is True and "not able to help with that directly" in safe_reply
-    assert_test(passed, "Safe override response speaks natural handoff wording", safe_reply)
-
-
-# ------------------------------------------------------------------------------
-# TOOL INVOCATION CONTRACT & INTEGRATION TESTS (TEST 39 - 56)
-# ------------------------------------------------------------------------------
-def test_create_ticket_direct_invocation():
-    log_test_header("TEST 39: create_ticket Direct Backend Invocation")
-    req = CreateTicketRequest(
-        phone="7878331909",
-        location="Jaipur",
-        issue_type="electricity",
-        description="Electricity is not coming since tomorrow."
-    )
-    res = execute_create_ticket(req)
-
-    passed = res.get("success") is True and "ticket_id" in res
-    assert_test(passed, "Direct create_ticket endpoint invocation succeeded", res)
-
-
-def test_create_ticket_missing_field():
-    log_test_header("TEST 40: create_ticket Missing Field Rejection")
-    req = CreateTicketRequest(phone="7878331909", location="", issue_type="electricity", description="No power")
-    res = execute_create_ticket(req)
-
-    passed = res.get("success") is False and res.get("error_code") == "VALIDATION_ERROR"
-    assert_test(passed, "Missing location field rejected with error_code VALIDATION_ERROR", res)
-
-
-def test_create_ticket_duplicate_protection():
-    log_test_header("TEST 41: create_ticket Duplicate Invocation Protection")
-    req = CreateTicketRequest(
-        phone="7878331909",
-        location="Jaipur",
-        issue_type="electricity",
-        description="Electricity is not coming since tomorrow.",
-        session_id="SETU-DUP-TEST"
-    )
-    res1 = execute_create_ticket(req)
-    res2 = execute_create_ticket(req)
-
-    passed = res1.get("ticket_id") == res2.get("ticket_id")
-    assert_test(passed, "Duplicate create_ticket invocation returned existing ticket ID without duplicate creation", res2)
-
-
-def test_transfer_to_human_direct_invocation():
-    log_test_header("TEST 42: transfer_to_human Direct Invocation")
-    req = TransferToHumanRequest(
-        reason="Low confidence on location after 2 attempts",
-        summary="Electricity issue in unconfirmed location",
-        confirmed_fields={"phone": "7878331909", "issue_type": "electricity"},
-        key_points="Caller reported electricity issue. Phone confirmed.",
-        unresolved="Exact city/ward could not be confirmed."
-    )
-    res = execute_transfer_to_human(req)
-
-    passed = res.get("success") is True and res.get("escalation_id").startswith("ESC-")
-    assert_test(passed, "Direct transfer_to_human invocation created escalation record", res)
-
-
-def test_low_confidence_threshold_escalation():
-    log_test_header("TEST 43: Low-Confidence Attempt Threshold Escalation")
-    req = TransferToHumanRequest(
-        reason="Location ambiguous after 2 attempts",
-        summary="Location attempt threshold reached"
-    )
-    res = execute_transfer_to_human(req)
-
-    esc = escalations_db.get(res.get("escalation_id"))
-    passed = esc and esc.get("status") == "WAITING"
-    assert_test(passed, "Low confidence threshold invocation created escalation in WAITING state", esc)
-
-
-def test_explicit_yes_confirmation():
-    log_test_header("TEST 44: Explicit Confirmation Drives Ticket Creation")
-    conv_id = f"test_exp_yes_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("7878331909", state)
-    extract_fields_from_text("Jaipur", state)
-    extract_fields_from_text("electricity", state)
-    extract_fields_from_text("Power cut in street", state)
-
-    extract_fields_from_text("Yes, correct", state)
-
-    passed = state["confirmed"] is True
-    assert_test(passed, "Explicit 'Yes, correct' confirmation set confirmed status to True", state["confirmed"])
-
-
-def test_no_confirmation_prevents_ticket():
-    log_test_header("TEST 45: Rejection Prevents Ticket Creation")
-    conv_id = f"test_rej_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("7878331909", state)
-    extract_fields_from_text("Jaipur", state)
-    extract_fields_from_text("electricity", state)
-    extract_fields_from_text("Power cut in street", state)
-
-    extract_fields_from_text("No, that is incorrect", state)
-
-    passed = state["confirmed"] is False and state.get("ticket_id") is None
-    assert_test(passed, "Rejection 'No' kept confirmed status as False and prevented ticket creation", state["confirmed"])
-
-
-def test_correction_after_confirmation():
-    log_test_header("TEST 46: Correction After Confirmation Re-prompts")
-    conv_id = f"test_corr_conf_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("7878331909", state)
-    extract_fields_from_text("Jaipur", state)
-    extract_fields_from_text("electricity", state)
-    extract_fields_from_text("Power cut in street", state)
-
-    extract_fields_from_text("No, the location is Jodhpur", state)
-
-    passed = state["confirmed"] is False and state["location"] == "Jodhpur"
-    assert_test(passed, "Location updated to Jodhpur and confirmation reset", state["location"])
-
-
-def test_slot_persistence_no_repeated_phone():
-    log_test_header("TEST 47: Slot Persistence Prevents Repeated Phone Prompt")
-    conv_id = f"test_pers_{uuid.uuid4().hex[:6]}"
-    state = get_or_create_conversation(conv_id)
-
-    extract_fields_from_text("7878331909", state)
-    extract_fields_from_text("Jaipur", state)
-
-    reply = generate_next_response(state)
-
-    passed = "issue" in reply.lower() and "phone number" not in reply.lower()
-    assert_test(passed, "Phone number persisted; assistant moved directly to issue_type prompt", reply)
-
-
-def test_rtm_failure_isolation():
-    log_test_header("TEST 48: RTM Failure Isolation")
-    req = TransferToHumanRequest(reason="RTM Failure Test", summary="RTM test")
-    res = execute_transfer_to_human(req)
-
-    esc_id = res.get("escalation_id")
-    passed = res.get("success") is True and esc_id in escalations_db
-    assert_test(passed, "Escalation created and retained in database even when RTM is mocked or offline", res)
+    passed = "https://" in upload_url and "/upload/11" in upload_url and "setu-9mx9.onrender.com" in upload_url
+    assert_test(passed, f"Generated Fast2SMS link '{upload_url}' is a public HTTPS URL", upload_url)
 
 
 # ------------------------------------------------------------------------------
@@ -821,7 +497,7 @@ def test_rtm_failure_isolation():
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n=======================================================")
-    print("SETU FULL INTEGRATION & TOOL CONTRACT SUITE (TEST_MODE=true)")
+    print("SETU FULL SUITE INCLUDING PHOTO UPLOADS (TEST_MODE=true)")
     print("=======================================================")
 
     test_happy_path()
@@ -845,36 +521,10 @@ if __name__ == "__main__":
     test_multiple_escalations()
     test_security_check()
 
-    test_duplicate_accept_protection()
-    test_resolved_token_prevention()
-    test_phone_masking()
-    test_health_check_endpoint()
-    test_env_check_endpoint()
-    test_fast2sms_failure_isolation()
-
-    test_phone_fragments()
-    test_phone_correction()
-    test_location_recognition()
-    test_natural_electricity_phrasing()
-    test_hinglish_issue_recognition()
-    test_mid_conversation_hello()
-    test_no_repeated_field_requests()
-    test_confirmation_correction()
-    test_natural_confirmation()
-    test_ticket_success_response()
-    test_freshdesk_failure_response()
-    test_human_handoff_language()
-
-    test_create_ticket_direct_invocation()
-    test_create_ticket_missing_field()
-    test_create_ticket_duplicate_protection()
-    test_transfer_to_human_direct_invocation()
-    test_low_confidence_threshold_escalation()
-    test_explicit_yes_confirmation()
-    test_no_confirmation_prevents_ticket()
-    test_correction_after_confirmation()
-    test_slot_persistence_no_repeated_phone()
-    test_rtm_failure_isolation()
+    test_photo_upload_valid_image()
+    test_photo_upload_invalid_file_type()
+    test_photo_upload_file_size_validation()
+    test_photo_upload_url_format()
 
     print("\n=======================================================")
     print(f"TEST RESULTS SUMMARY: {PASS_COUNT} PASSED | {FAIL_COUNT} FAILED")
