@@ -743,6 +743,8 @@ async def get_escalations():
 # Photo Evidence Upload Pages & Endpoints
 # ------------------------------------------------------------------------------
 @app.get("/upload/{ticket_id}", response_class=HTMLResponse)
+@app.get("/api/upload/{ticket_id}", response_class=HTMLResponse)
+@app.get("/upload_page/{ticket_id}", response_class=HTMLResponse)
 async def upload_page(ticket_id: str):
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -929,6 +931,8 @@ async def upload_page(ticket_id: str):
 
 
 @app.post("/upload/{ticket_id}")
+@app.post("/api/upload/{ticket_id}")
+@app.post("/upload_page/{ticket_id}")
 async def process_photo_upload(ticket_id: str, photo: UploadFile = File(...)):
     start_time = time.time()
     session_id = f"SETU-UPLOAD-{ticket_id}"
