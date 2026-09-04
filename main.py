@@ -13,8 +13,8 @@ import random
 import logging
 
 app = FastAPI(
-    title="Setu Municipal Helpline Backend & Observability Service",
-    description="Backend tool execution server with structured logging, session correlation, human voice handoff, and pilot metrics",
+    title="Setu Municipal Helpline Backend & Pilot Observability Service",
+    description="Backend tool execution server with structured logging, session correlation, human voice handoff, and pilot feedback",
     version="3.5.0"
 )
 
@@ -36,11 +36,10 @@ WORD_TO_DIGIT = {
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
 }
 
-# ------------------------------------------------------------------------------
-# In-Memory Persistence & Observability Metrics
-# ------------------------------------------------------------------------------
+# In-memory persistence databases & Pilot Feedback
 conversations_db: Dict[str, Dict[str, Any]] = {}
 escalations_db: Dict[str, Dict[str, Any]] = {}
+pilot_feedback_list: List[Dict[str, Any]] = []
 
 metrics_counter = {
     "conversations_started": 0,
@@ -196,8 +195,11 @@ class TransferToHumanRequest(BaseModel):
     session_id: Optional[str] = None
 
 
-class StatusUpdateRequest(BaseModel):
-    status: str
+class PilotFeedbackRequest(BaseModel):
+    category: str = Field(..., description="Category: voice_recognition, info_extraction, misunderstood, response_slow, ticket_problem, sms_problem, handoff_problem, other")
+    comment: str
+    session_id: Optional[str] = None
+    rating: Optional[int] = Field(5, ge=1, le=5)
 
 
 # ------------------------------------------------------------------------------
@@ -645,7 +647,7 @@ def execute_transfer_to_human(data: TransferToHumanRequest) -> Dict[str, Any]:
 async def root():
     return {
         "status": "Setu Supporting Tools Backend is active!",
-        "architecture": "Agora Conversational AI Backend Tool Execution & Production Hardened Server",
+        "architecture": "Agora Conversational AI Backend Tool Execution & Pilot Observability Server",
         "tools": ["create_ticket", "transfer_to_human"],
         "console_url": "/console",
         "total_escalations": len(escalations_db)
@@ -659,7 +661,6 @@ async def health():
 
 @app.get("/api/metrics")
 async def get_metrics():
-    """Observability pilot metrics endpoint."""
     total_created = metrics_counter["tickets_created"]
     avg_latency = (
         int(metrics_counter["total_ticket_latency_ms"] / total_created)
@@ -686,6 +687,28 @@ async def env_check():
         "agora": "configured" if os.environ.get("AGORA_APP_ID") else "configured_fallback",
         "TEST_MODE": os.environ.get("TEST_MODE", "false")
     }
+
+
+# Pilot Feedback Submission API
+@app.post("/api/pilot/feedback")
+async def submit_pilot_feedback(data: PilotFeedbackRequest):
+    session_id = data.session_id or generate_session_id()
+    entry = {
+        "id": f"fb-{uuid.uuid4().hex[:6]}",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "category": data.category,
+        "comment": data.comment,
+        "session_id": session_id,
+        "rating": data.rating
+    }
+    pilot_feedback_list.append(entry)
+    log_structured_event("pilot.feedback_submitted", session_id, category=data.category, rating=data.rating)
+    return {"success": True, "feedback_id": entry["id"], "message": "Pilot feedback recorded successfully."}
+
+
+@app.get("/api/pilot/feedback")
+async def get_pilot_feedback():
+    return pilot_feedback_list
 
 
 @app.get("/console", response_class=HTMLResponse)
