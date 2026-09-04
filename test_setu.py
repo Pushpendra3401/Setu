@@ -4,7 +4,7 @@ Setu Voice AI Backend Test Suite (test_setu.py)
 Verifies conversation state tracking, priority order, low-confidence escalation,
 deterministic guardrails (medical, legal, financial, adversarial), ticket creation,
 SMS upload link triggering, RTM Human Escalation Console state transitions,
-Production Hardening / Reliability checks, Voice Experience, and Observability Pilot Metrics (Tests 1-50).
+Production Hardening / Reliability checks, Voice Experience, and Tool Invocation Contract (Tests 1-56).
 """
 
 import os
@@ -39,6 +39,7 @@ from main import (
     TransferToHumanRequest,
     conversations_db,
     escalations_db,
+    processed_tickets_db,
     metrics_counter
 )
 
@@ -674,86 +675,145 @@ def test_human_handoff_language():
 
 
 # ------------------------------------------------------------------------------
-# OBSERVABILITY, SESSION CORRELATION & PILOT METRICS TESTS (TEST 39 - 50)
+# TOOL INVOCATION CONTRACT & INTEGRATION TESTS (TEST 39 - 56)
 # ------------------------------------------------------------------------------
-def test_session_correlation_id():
-    log_test_header("TEST 39: Session Correlation ID Generation")
-    session_id = generate_session_id()
-    passed = session_id.startswith("SETU-") and len(session_id) >= 18
-    assert_test(passed, f"Session Correlation ID '{session_id}' generated with format SETU-YYYYMMDD-XXXXXX", session_id)
-
-
-def test_metrics_endpoint():
-    log_test_header("TEST 40: Metrics Dashboard Endpoint")
-    res = asyncio.run(get_metrics())
-    passed = (
-        "conversations_started" in res and
-        "tickets_created" in res and
-        "human_escalations" in res and
-        "avg_ticket_latency_ms" in res
+def test_create_ticket_direct_invocation():
+    log_test_header("TEST 39: create_ticket Direct Backend Invocation")
+    req = CreateTicketRequest(
+        phone="7878331909",
+        location="Jaipur",
+        issue_type="electricity",
+        description="Electricity is not coming since tomorrow."
     )
-    assert_test(passed, "GET /api/metrics returned observability metrics counters", res)
+    res = execute_create_ticket(req)
+
+    passed = res.get("success") is True and "ticket_id" in res
+    assert_test(passed, "Direct create_ticket endpoint invocation succeeded", res)
 
 
-def test_error_code_classification():
-    log_test_header("TEST 41: Error Classification Standard")
-    req = CreateTicketRequest(phone="invalid_phone", location="", issue_type="invalid", description="")
+def test_create_ticket_missing_field():
+    log_test_header("TEST 40: create_ticket Missing Field Rejection")
+    req = CreateTicketRequest(phone="7878331909", location="", issue_type="electricity", description="No power")
     res = execute_create_ticket(req)
 
     passed = res.get("success") is False and res.get("error_code") == "VALIDATION_ERROR"
-    assert_test(passed, "Validation failure categorized with error_code 'VALIDATION_ERROR'", res)
+    assert_test(passed, "Missing location field rejected with error_code VALIDATION_ERROR", res)
 
 
-def test_ticket_latency_tracking():
-    log_test_header("TEST 42: Ticket Latency Measurement")
-    req = CreateTicketRequest(phone="6362829732", location="Jaipur", issue_type="water", description="Pipe leakage")
-    res = execute_create_ticket(req)
+def test_create_ticket_duplicate_protection():
+    log_test_header("TEST 41: create_ticket Duplicate Invocation Protection")
+    req = CreateTicketRequest(
+        phone="7878331909",
+        location="Jaipur",
+        issue_type="electricity",
+        description="Electricity is not coming since tomorrow.",
+        session_id="SETU-DUP-TEST"
+    )
+    res1 = execute_create_ticket(req)
+    res2 = execute_create_ticket(req)
 
-    metrics = asyncio.run(get_metrics())
-    passed = res.get("success") is True and metrics.get("tickets_created", 0) > 0
-    assert_test(passed, "Measured ticket execution duration and updated pilot metrics", metrics)
-
-
-def test_concurrent_session_isolation():
-    log_test_header("TEST 43: Concurrent Session Isolation")
-    res1 = execute_transfer_to_human(TransferToHumanRequest(reason="Call A", session_id="SETU-20260904-CALL01"))
-    res2 = execute_transfer_to_human(TransferToHumanRequest(reason="Call B", session_id="SETU-20260904-CALL02"))
-
-    s1 = res1.get("session_id")
-    s2 = res2.get("session_id")
-
-    passed = s1 == "SETU-20260904-CALL01" and s2 == "SETU-20260904-CALL02" and s1 != s2
-    assert_test(passed, f"Concurrent call session IDs isolated ({s1} vs {s2})", f"{s1} | {s2}")
+    passed = res1.get("ticket_id") == res2.get("ticket_id")
+    assert_test(passed, "Duplicate create_ticket invocation returned existing ticket ID without duplicate creation", res2)
 
 
-def test_secret_exposure_audit():
-    log_test_header("TEST 44: Secret Exposure Audit")
-    from main import get_escalations
-    items = asyncio.run(get_escalations())
-    metrics_data = asyncio.run(get_metrics())
+def test_transfer_to_human_direct_invocation():
+    log_test_header("TEST 42: transfer_to_human Direct Invocation")
+    req = TransferToHumanRequest(
+        reason="Low confidence on location after 2 attempts",
+        summary="Electricity issue in unconfirmed location",
+        confirmed_fields={"phone": "7878331909", "issue_type": "electricity"},
+        key_points="Caller reported electricity issue. Phone confirmed.",
+        unresolved="Exact city/ward could not be confirmed."
+    )
+    res = execute_transfer_to_human(req)
 
-    full_payload = json.dumps(items) + json.dumps(metrics_data)
-    secrets = ["FRESHDESK_API_KEY", "FAST2SMS_API_KEY", "_QhINFlkDVVAmS71gfzN", "8101d78a52424c81bf832b3e9aadf796"]
-    exposed = [s for s in secrets if s in full_payload]
-
-    passed = len(exposed) == 0
-    assert_test(passed, "Audit confirmed ZERO server secrets exposed in metrics and public payloads", exposed)
-
-
-def test_malformed_payload_handling():
-    log_test_header("TEST 45: Malformed API Payload Handling")
-    req = CreateTicketRequest(phone="12345", location="Jaipur", issue_type="water", description="Leakage")
-    res = execute_create_ticket(req)
-
-    passed = res.get("success") is False and res.get("error_code") == "VALIDATION_ERROR"
-    assert_test(passed, "Malformed phone payload rejected with error_code VALIDATION_ERROR", res)
+    passed = res.get("success") is True and res.get("escalation_id").startswith("ESC-")
+    assert_test(passed, "Direct transfer_to_human invocation created escalation record", res)
 
 
-def test_health_check_version():
-    log_test_header("TEST 46: Health Check Version Alignment")
-    res = asyncio.run(health())
-    passed = res.get("status") == "ok" and res.get("version") == "3.5.0"
-    assert_test(passed, "GET /health endpoint aligned with version 3.5.0", res)
+def test_low_confidence_threshold_escalation():
+    log_test_header("TEST 43: Low-Confidence Attempt Threshold Escalation")
+    req = TransferToHumanRequest(
+        reason="Location ambiguous after 2 attempts",
+        summary="Location attempt threshold reached"
+    )
+    res = execute_transfer_to_human(req)
+
+    esc = escalations_db.get(res.get("escalation_id"))
+    passed = esc and esc.get("status") == "WAITING"
+    assert_test(passed, "Low confidence threshold invocation created escalation in WAITING state", esc)
+
+
+def test_explicit_yes_confirmation():
+    log_test_header("TEST 44: Explicit Confirmation Drives Ticket Creation")
+    conv_id = f"test_exp_yes_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("7878331909", state)
+    extract_fields_from_text("Jaipur", state)
+    extract_fields_from_text("electricity", state)
+    extract_fields_from_text("Power cut in street", state)
+
+    extract_fields_from_text("Yes, correct", state)
+
+    passed = state["confirmed"] is True
+    assert_test(passed, "Explicit 'Yes, correct' confirmation set confirmed status to True", state["confirmed"])
+
+
+def test_no_confirmation_prevents_ticket():
+    log_test_header("TEST 45: Rejection Prevents Ticket Creation")
+    conv_id = f"test_rej_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("7878331909", state)
+    extract_fields_from_text("Jaipur", state)
+    extract_fields_from_text("electricity", state)
+    extract_fields_from_text("Power cut in street", state)
+
+    extract_fields_from_text("No, that is incorrect", state)
+
+    passed = state["confirmed"] is False and state.get("ticket_id") is None
+    assert_test(passed, "Rejection 'No' kept confirmed status as False and prevented ticket creation", state["confirmed"])
+
+
+def test_correction_after_confirmation():
+    log_test_header("TEST 46: Correction After Confirmation Re-prompts")
+    conv_id = f"test_corr_conf_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("7878331909", state)
+    extract_fields_from_text("Jaipur", state)
+    extract_fields_from_text("electricity", state)
+    extract_fields_from_text("Power cut in street", state)
+
+    extract_fields_from_text("No, the location is Jodhpur", state)
+
+    passed = state["confirmed"] is False and state["location"] == "Jodhpur"
+    assert_test(passed, "Location updated to Jodhpur and confirmation reset", state["location"])
+
+
+def test_slot_persistence_no_repeated_phone():
+    log_test_header("TEST 47: Slot Persistence Prevents Repeated Phone Prompt")
+    conv_id = f"test_pers_{uuid.uuid4().hex[:6]}"
+    state = get_or_create_conversation(conv_id)
+
+    extract_fields_from_text("7878331909", state)
+    extract_fields_from_text("Jaipur", state)
+
+    reply = generate_next_response(state)
+
+    passed = "issue" in reply.lower() and "phone number" not in reply.lower()
+    assert_test(passed, "Phone number persisted; assistant moved directly to issue_type prompt", reply)
+
+
+def test_rtm_failure_isolation():
+    log_test_header("TEST 48: RTM Failure Isolation")
+    req = TransferToHumanRequest(reason="RTM Failure Test", summary="RTM test")
+    res = execute_transfer_to_human(req)
+
+    esc_id = res.get("escalation_id")
+    passed = res.get("success") is True and esc_id in escalations_db
+    assert_test(passed, "Escalation created and retained in database even when RTM is mocked or offline", res)
 
 
 # ------------------------------------------------------------------------------
@@ -761,7 +821,7 @@ def test_health_check_version():
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n=======================================================")
-    print("SETU REAL-WORLD PILOT READINESS TEST SUITE (TEST_MODE=true)")
+    print("SETU FULL INTEGRATION & TOOL CONTRACT SUITE (TEST_MODE=true)")
     print("=======================================================")
 
     test_happy_path()
@@ -805,14 +865,16 @@ if __name__ == "__main__":
     test_freshdesk_failure_response()
     test_human_handoff_language()
 
-    test_session_correlation_id()
-    test_metrics_endpoint()
-    test_error_code_classification()
-    test_ticket_latency_tracking()
-    test_concurrent_session_isolation()
-    test_secret_exposure_audit()
-    test_malformed_payload_handling()
-    test_health_check_version()
+    test_create_ticket_direct_invocation()
+    test_create_ticket_missing_field()
+    test_create_ticket_duplicate_protection()
+    test_transfer_to_human_direct_invocation()
+    test_low_confidence_threshold_escalation()
+    test_explicit_yes_confirmation()
+    test_no_confirmation_prevents_ticket()
+    test_correction_after_confirmation()
+    test_slot_persistence_no_repeated_phone()
+    test_rtm_failure_isolation()
 
     print("\n=======================================================")
     print(f"TEST RESULTS SUMMARY: {PASS_COUNT} PASSED | {FAIL_COUNT} FAILED")

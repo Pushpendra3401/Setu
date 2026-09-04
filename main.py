@@ -860,9 +860,23 @@ async def create_ticket_endpoint(request: Request):
     elif "parameters" in body:
         body = body["parameters"]
 
+    session_id = body.get("session_id", generate_session_id())
+    masked_p = mask_phone(body.get("phone", ""))
+
+    print("\n========== AGORA TOOL CALL RECEIVED ==========")
+    print(f"Tool:         create_ticket")
+    print(f"Session ID:   {session_id}")
+    print(f"Timestamp:    {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Phone:        {masked_p}")
+    print(f"Location:     {body.get('location')}")
+    print(f"Issue Type:   {body.get('issue_type')}")
+    print(f"Description:  {body.get('description')}")
+    print("==============================================\n")
+
     try:
         ticket_req = CreateTicketRequest(**body)
     except Exception as e:
+        log_structured_event("tool_call.failed", session_id, tool="create_ticket", error=str(e))
         return {"success": False, "error_code": "VALIDATION_ERROR", "message": f"Missing parameters: {str(e)}"}
 
     return execute_create_ticket(ticket_req)
@@ -882,9 +896,24 @@ async def transfer_to_human_endpoint(request: Request):
     elif "parameters" in body:
         body = body["parameters"]
 
+    session_id = body.get("session_id", generate_session_id())
+
+    print("\n========== AGORA TOOL CALL RECEIVED ==========")
+    print(f"Tool:             transfer_to_human")
+    print(f"Session ID:       {session_id}")
+    print(f"Timestamp:        {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Reason:           {body.get('reason')}")
+    print(f"Summary:          {body.get('summary')}")
+    print(f"Issue One-Line:   {body.get('issue_one_line')}")
+    print(f"Confirmed Fields: {json.dumps(body.get('confirmed_fields', {}))}")
+    print(f"Key Points:       {body.get('key_points')}")
+    print(f"Unresolved:       {body.get('unresolved')}")
+    print("==============================================\n")
+
     try:
         transfer_req = TransferToHumanRequest(**body)
     except Exception as e:
+        log_structured_event("tool_call.failed", session_id, tool="transfer_to_human", error=str(e))
         return {"success": False, "error_code": "VALIDATION_ERROR", "message": f"Missing parameters: {str(e)}"}
 
     return execute_transfer_to_human(transfer_req)
